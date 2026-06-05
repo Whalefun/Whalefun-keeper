@@ -16,7 +16,8 @@
 import { ethers } from "ethers";
 
 const RPC = process.env.RPC_URL || "https://bsc-rpc.publicnode.com";
-const PK = process.env.KEEPER_PK;
+// 私钥归一化:带不带 0x 前缀都能用(去空格、缺 0x 自动补)。
+const PK = (() => { const k = (process.env.KEEPER_PK || "").trim(); return k ? (k.startsWith("0x") ? k : "0x" + k) : k; })();
 const FACTORY = process.env.LAUNCH_FACTORY_V2;
 const MIN_OWED = BigInt(process.env.MIN_OWED_WEI || "100000000000000"); // 1e14
 const BATCH = Number(process.env.BATCH || "100");
