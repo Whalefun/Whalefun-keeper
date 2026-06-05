@@ -99,20 +99,27 @@ async function processVault(vaultAddr) {
       console.log(`[vault ${vaultAddr}] syncPlatformDividend → tx ${rc.hash}`);
     }
   } catch { /* 非 DWC 金库 / 无此方法 → 跳过 */ }
-  // 2. 轮次到 + 任一池满 perLeg 才触发(省 gas,避免空跑)
+  // 2. 读金库状态。读不到 = 非 DWC 金库(如 LP 托管金库)→ 静默跳过。
+  let secs, divB, buyB;
   try {
-    const [secs, divB, buyB] = await Promise.all([
+    [secs, divB, buyB] = await Promise.all([
       vault.secondsUntilNextSnowball(),
       vault.dividendBudget(),
       vault.buybackBudget(),
     ]);
-    if (secs === 0n && (divB >= PER_LEG || buyB >= PER_LEG)) {
-      // 显式高 gas:分红腿买 FLAP 税费代币单条 ~282k,两条腿 + 开销留足余量。
-      // 不靠自动估算(合约虽加了 gas 地板修正估算,这里再兜底一层)。
-      const rc = await (await vault.snowball({ gasLimit: 900000 })).wait();
-      console.log(`[vault ${vaultAddr}] snowball → tx ${rc.hash}`);
-    }
-  } catch (e) { /* 非 DWC 金库 / 无此方法 → 跳过 */ void e; }
+  } catch { return; } // 非 DWC 金库,不打日志
+  const fmt = (x) => ethers.formatEther(x);
+  console.log(`[vault ${vaultAddr}] secsToNext=${secs} dividendBudget=${fmt(divB)} buybackBudget=${fmt(buyB)}`);
+  // 轮次到 + 任一池满 perLeg 才触发(省 gas,避免空跑);否则打日志说明原因。
+  if (secs !== 0n) { console.log(`[vault ${vaultAddr}] 未到下一轮(还差 ${secs}s),跳过`); return; }
+  if (divB < PER_LEG && buyB < PER_LEG) { console.log(`[vault ${vaultAddr}] 两池均未满 ${fmt(PER_LEG)} BNB,跳过`); return; }
+  try {
+    // 显式高 gas:分红腿买 FLAP 税费代币单条 ~282k,两条腿 + 开销留足余量。
+    const rc = await (await vault.snowball({ gasLimit: 900000 })).wait();
+    console.log(`[vault ${vaultAddr}] snowball ✅ → tx ${rc.hash}`);
+  } catch (e) {
+    console.error(`[vault ${vaultAddr}] snowball 失败:`, e.shortMessage || e.message);
+  }
 }
 
 async function runOnce() {
