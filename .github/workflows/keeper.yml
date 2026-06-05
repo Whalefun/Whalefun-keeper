@@ -44,6 +44,10 @@ jobs:
           RPC_URL: ${{ vars.RPC_URL || 'https://bsc-dataseed.bnbchain.org' }}
           # Mainnet LaunchFactoryV2 (FLAP share-push + gas-floor build). Override via repo variable.
           LAUNCH_FACTORY_V2: ${{ vars.LAUNCH_FACTORY_V2 || '0x2196D9B1Ee3411a4C6E26a417861713151EcdC07' }}
+          # Dead-token filter: skip launches whose pool WBNB < this many BNB (default 0.3). Set repo var to tune.
+          MIN_POOL_BNB: ${{ vars.MIN_POOL_BNB || '0.3' }}
+          # Manual skip list: comma-separated token addresses to always ignore. Set repo var SKIP_TOKENS.
+          SKIP_TOKENS: ${{ vars.SKIP_TOKENS }}
         run: |
           if [ -z "$KEEPER_PK" ]; then
             echo "::warning::KEEPER_PK secret not set — skipping. Add it in repo Settings → Secrets to enable the keeper."

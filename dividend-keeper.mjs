@@ -19,6 +19,18 @@ const RPC = process.env.RPC_URL || "https://bsc-rpc.publicnode.com";
 // 私钥归一化:带不带 0x 前缀都能用(去空格、缺 0x 自动补)。
 const PK = (() => { const k = (process.env.KEEPER_PK || "").trim(); return k ? (k.startsWith("0x") ? k : "0x" + k) : k; })();
 const FACTORY = process.env.LAUNCH_FACTORY_V2;
+// 跳过名单:死币/废弃币的【代币地址】,逗号分隔。在仓库 Variables 里配 SKIP_TOKENS,改名单不用动代码。
+const SKIP = new Set(
+  (process.env.SKIP_TOKENS || "").split(/[\s,;]+/).map((s) => s.trim().toLowerCase()).filter(Boolean)
+);
+// 死币判定:底池 WBNB 低于此值就跳过(代币已崩、池子枯竭,再 snowball 只会把金库 BNB 砸进死池,纯浪费)。
+// 默认 0.3 BNB,可用仓库 Variable MIN_POOL_BNB 调(填 BNB 数,如 "0.5")。
+const MIN_POOL_BNB = (() => { try { return ethers.parseEther(String(process.env.MIN_POOL_BNB || "0.3")); } catch { return ethers.parseEther("0.3"); } })();
+const WBNB = "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c";
+const PAIR_ABI = [
+  "function getReserves() view returns (uint112,uint112,uint32)",
+  "function token0() view returns (address)",
+];
 const MIN_OWED = BigInt(process.env.MIN_OWED_WEI || "100000000000000"); // 1e14
 const BATCH = Number(process.env.BATCH || "100");
 const INTERVAL_MS = Number(process.env.INTERVAL_MS || "300000");
@@ -135,6 +147,18 @@ async function runOnce() {
       console.error(`launch #${i} 读取失败:`, e.shortMessage || e.message);
       continue;
     }
+    // 手动跳过名单
+    if (SKIP.has(String(info.token).toLowerCase())) { console.log(`launch #${i} 在 SKIP 名单,忽略`); continue; }
+    // 死币自动过滤:底池 WBNB 太低 → 代币已崩,别拿金库 BNB 砸进枯竭的池子(金库 BNB 留在原地不动)。
+    try {
+      const pair = new ethers.Contract(info.pair, PAIR_ABI, provider);
+      const [r, t0] = await Promise.all([pair.getReserves(), pair.token0()]);
+      const wbnbRes = String(t0).toLowerCase() === WBNB.toLowerCase() ? r[0] : r[1];
+      if (wbnbRes < MIN_POOL_BNB) {
+        console.log(`launch #${i} (${info.token}) 底池仅 ${ethers.formatEther(wbnbRes)} BNB < ${ethers.formatEther(MIN_POOL_BNB)},判定死币,跳过`);
+        continue;
+      }
+    } catch { continue; } // 池子读不到(未开盘/无池)→ 本轮跳过
     // token 与金库分开 try:代币侧报错(如 RPC 偶发 missing revert data)不能连累金库 snowball。
     try { await processToken(info.token); } catch (e) { console.error(`launch #${i} token:`, e.shortMessage || e.message); }
     // 分红金库 = taxVault(索引2),不是 vault(索引1,那是 LP 托管金库,没有 snowball)。
