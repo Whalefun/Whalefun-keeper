@@ -149,16 +149,21 @@ async function runOnce() {
     }
     // 手动跳过名单
     if (SKIP.has(String(info.token).toLowerCase())) { console.log(`launch #${i} 在 SKIP 名单,忽略`); continue; }
-    // 死币自动过滤:底池 WBNB 太低 → 代币已崩,别拿金库 BNB 砸进枯竭的池子(金库 BNB 留在原地不动)。
+    // ① 内盘/未开盘:startTradeBlock==0 → 还没开盘交易、没税没分红,跳过(不是死币)。
+    try {
+      const stb = await new ethers.Contract(info.token, TOKEN_ABI, provider).startTradeBlock();
+      if (stb === 0n) { console.log(`launch #${i} (${info.token}) 内盘未开盘,无分红,跳过`); continue; }
+    } catch { console.log(`launch #${i} 读 startTradeBlock 失败,跳过`); continue; }
+    // ② 死币:已开盘但底池 WBNB 太低 → 代币已崩,别拿金库 BNB 砸进枯竭的池子(金库 BNB 留在原地不动)。
     try {
       const pair = new ethers.Contract(info.pair, PAIR_ABI, provider);
       const [r, t0] = await Promise.all([pair.getReserves(), pair.token0()]);
       const wbnbRes = String(t0).toLowerCase() === WBNB.toLowerCase() ? r[0] : r[1];
       if (wbnbRes < MIN_POOL_BNB) {
-        console.log(`launch #${i} (${info.token}) 底池仅 ${ethers.formatEther(wbnbRes)} BNB < ${ethers.formatEther(MIN_POOL_BNB)},判定死币,跳过`);
+        console.log(`launch #${i} (${info.token}) 已开盘但底池仅 ${ethers.formatEther(wbnbRes)} BNB < ${ethers.formatEther(MIN_POOL_BNB)},判定死币,跳过`);
         continue;
       }
-    } catch { continue; } // 池子读不到(未开盘/无池)→ 本轮跳过
+    } catch { continue; } // 池子读不到 → 本轮跳过
     // token 与金库分开 try:代币侧报错(如 RPC 偶发 missing revert data)不能连累金库 snowball。
     try { await processToken(info.token); } catch (e) { console.error(`launch #${i} token:`, e.shortMessage || e.message); }
     // 分红金库 = taxVault(索引2),不是 vault(索引1,那是 LP 托管金库,没有 snowball)。
