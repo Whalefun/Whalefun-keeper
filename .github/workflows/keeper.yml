@@ -1,0 +1,52 @@
+name: dividend-keeper
+
+# Drives Whale.fun dividends on a schedule: for each v2 token it pushes accrued
+# dividends (distributeTo) and triggers each dividend vault's snowball + cold-start sync.
+# Everything it calls is PERMISSIONLESS — the hot wallet only pays gas and holds no privileges.
+#
+# One-time setup:
+#   1) Generate a FRESH wallet (NOT the owner/deployer/guardian key). Fund it with a little BNB for gas.
+#   2) Repo Settings → Secrets and variables → Actions → New repository secret:
+#        name  = KEEPER_PK      value = that fresh wallet's private key (0x...)
+#   3) (optional) Repo Variables to override the defaults below: RPC_URL, LAUNCH_FACTORY_V2
+#   4) Push this repo. It then runs on the schedule below; you can also run it manually
+#      from the Actions tab (Run workflow).
+#
+# Tip: use a PUBLIC repo so GitHub Actions minutes are free/unlimited (private repos cap at 2000 min/mo).
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"   # every ~10 min (GitHub schedules are best-effort / may be delayed)
+  workflow_dispatch: {}        # allow manual runs from the Actions tab
+
+concurrency:
+  group: dividend-keeper
+  cancel-in-progress: false    # never run two keeper rounds at once (avoids nonce clashes)
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install deps
+        run: npm install --no-audit --no-fund
+
+      - name: Run keeper (one round)
+        env:
+          KEEPER_PK: ${{ secrets.KEEPER_PK }}
+          # Reliable BSC mainnet RPC; override with repo variable RPC_URL if needed.
+          RPC_URL: ${{ vars.RPC_URL || 'https://bsc-dataseed.bnbchain.org' }}
+          # Mainnet LaunchFactoryV2 (FLAP share-push + gas-floor build). Override via repo variable.
+          LAUNCH_FACTORY_V2: ${{ vars.LAUNCH_FACTORY_V2 || '0x2196D9B1Ee3411a4C6E26a417861713151EcdC07' }}
+        run: |
+          if [ -z "$KEEPER_PK" ]; then
+            echo "::warning::KEEPER_PK secret not set — skipping. Add it in repo Settings → Secrets to enable the keeper."
+            exit 0
+          fi
+          node dividend-keeper.mjs
