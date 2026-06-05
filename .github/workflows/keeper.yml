@@ -16,7 +16,7 @@ name: dividend-keeper
 
 on:
   schedule:
-    - cron: "*/10 * * * *"   # every ~10 min (GitHub schedules are best-effort / may be delayed)
+    - cron: "*/15 * * * *"   # every ~15 min (GitHub schedules are best-effort / may be delayed)
   workflow_dispatch: {}        # allow manual runs from the Actions tab
 
 concurrency:
