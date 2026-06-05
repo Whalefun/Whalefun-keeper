@@ -24,8 +24,8 @@ const SKIP = new Set(
   (process.env.SKIP_TOKENS || "").split(/[\s,;]+/).map((s) => s.trim().toLowerCase()).filter(Boolean)
 );
 // 死币判定:底池 WBNB 低于此值就跳过(代币已崩、池子枯竭,再 snowball 只会把金库 BNB 砸进死池,纯浪费)。
-// 默认 0.3 BNB,可用仓库 Variable MIN_POOL_BNB 调(填 BNB 数,如 "0.5")。
-const MIN_POOL_BNB = (() => { try { return ethers.parseEther(String(process.env.MIN_POOL_BNB || "0.3")); } catch { return ethers.parseEther("0.3"); } })();
+// 默认 2 BNB,可用仓库 Variable MIN_POOL_BNB 调(填 BNB 数,如 "1.5")。
+const MIN_POOL_BNB = (() => { try { return ethers.parseEther(String(process.env.MIN_POOL_BNB || "2")); } catch { return ethers.parseEther("2"); } })();
 const WBNB = "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c";
 const PAIR_ABI = [
   "function getReserves() view returns (uint112,uint112,uint32)",
