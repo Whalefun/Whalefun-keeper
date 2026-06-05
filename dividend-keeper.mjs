@@ -114,8 +114,9 @@ async function processVault(vaultAddr) {
   if (secs !== 0n) { console.log(`[vault ${vaultAddr}] 未到下一轮(还差 ${secs}s),跳过`); return; }
   if (divB < PER_LEG && buyB < PER_LEG) { console.log(`[vault ${vaultAddr}] 两池均未满 ${fmt(PER_LEG)} BNB,跳过`); return; }
   try {
-    // 显式高 gas:分红腿买 FLAP 税费代币单条 ~282k,两条腿 + 开销留足余量。
-    const rc = await (await vault.snowball({ gasLimit: 900000 })).wait();
+    // 显式高 gas:两条腿(尤其买 $WHALE 这种带税+分红的复杂币)实测 ~1.07M,合约还有 gasleft 地板,
+    // 给 2M 留足余量(用不完自动退,只按实际用量计费)。
+    const rc = await (await vault.snowball({ gasLimit: 2000000 })).wait();
     console.log(`[vault ${vaultAddr}] snowball ✅ → tx ${rc.hash}`);
   } catch (e) {
     console.error(`[vault ${vaultAddr}] snowball 失败:`, e.shortMessage || e.message);
