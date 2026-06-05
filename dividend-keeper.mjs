@@ -34,6 +34,7 @@ const FACTORY_ABI = [
 ];
 const TOKEN_ABI = [
   "function startTradeBlock() view returns (uint256)",
+  "function bucketDividendBps() view returns (uint16)",
   "function holderCount() view returns (uint256)",
   "function holderAt(uint256) view returns (address)",
   "function withdrawableDividendOf(address) view returns (uint256)",
@@ -56,17 +57,20 @@ const wallet = new ethers.Wallet(PK, provider);
 async function processToken(tokenAddr) {
   const token = new ethers.Contract(tokenAddr, TOKEN_ABI, wallet);
   if ((await token.startTradeBlock()) === 0n) return; // 未开盘,无分红
+  // 自带分红桶=0 的币(分红走金库)→ 不必扫持有人 distributeTo,交给金库 snowball,省 RPC、免噪音。
+  try { if (Number(await token.bucketDividendBps()) === 0) return; } catch { return; }
 
   const n = Number(await token.holderCount());
   if (n === 0) return;
 
-  // 读所有持有人 → 算谁欠分红(分块并发读,避免一次过载 RPC)
+  // 读所有持有人 → 算谁欠分红(分块并发读;allSettled 容忍 RPC 偶发抽风,不中断整轮)
   const owed = [];
   for (let i = 0; i < n; i += 50) {
     const idxs = Array.from({ length: Math.min(50, n - i) }, (_, k) => i + k);
-    const addrs = await Promise.all(idxs.map((j) => token.holderAt(j)));
-    const amts = await Promise.all(addrs.map((a) => token.withdrawableDividendOf(a)));
-    addrs.forEach((a, k) => { if (amts[k] >= MIN_OWED) owed.push(a); });
+    const addrsR = await Promise.allSettled(idxs.map((j) => token.holderAt(j)));
+    const addrs = addrsR.filter((r) => r.status === "fulfilled").map((r) => r.value);
+    const amtsR = await Promise.allSettled(addrs.map((a) => token.withdrawableDividendOf(a)));
+    amtsR.forEach((r, k) => { if (r.status === "fulfilled" && r.value >= MIN_OWED) owed.push(addrs[k]); });
   }
   if (owed.length === 0) return;
 
@@ -116,13 +120,17 @@ async function runOnce() {
   const count = Number(await factory.launchCount());
   console.log(`扫描 ${count} 个 v2 代币 · keeper ${wallet.address}`);
   for (let i = 0; i < count; i++) {
+    let info;
     try {
-      const info = await factory.launches(i);
-      await processToken(info.token);
-      await processVault(info.vault); // 金库分红:同步 oracle + 触发 snowball
+      info = await factory.launches(i);
     } catch (e) {
-      console.error(`launch #${i} 处理出错:`, e.shortMessage || e.message);
+      console.error(`launch #${i} 读取失败:`, e.shortMessage || e.message);
+      continue;
     }
+    // token 与金库分开 try:代币侧报错(如 RPC 偶发 missing revert data)不能连累金库 snowball。
+    try { await processToken(info.token); } catch (e) { console.error(`launch #${i} token:`, e.shortMessage || e.message); }
+    // 分红金库 = taxVault(索引2),不是 vault(索引1,那是 LP 托管金库,没有 snowball)。
+    try { await processVault(info.taxVault); } catch (e) { console.error(`launch #${i} vault:`, e.shortMessage || e.message); }
   }
   console.log("本轮完成");
 }
