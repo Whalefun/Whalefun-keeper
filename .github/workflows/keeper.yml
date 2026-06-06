@@ -42,8 +42,9 @@ jobs:
           KEEPER_PK: ${{ secrets.KEEPER_PK }}
           # Reliable BSC mainnet RPC; override with repo variable RPC_URL if needed.
           RPC_URL: ${{ vars.RPC_URL || 'https://bsc-dataseed.bnbchain.org' }}
-          # Mainnet LaunchFactoryV2 (FLAP share-push + gas-floor build). Override via repo variable.
-          LAUNCH_FACTORY_V2: ${{ vars.LAUNCH_FACTORY_V2 || '0x2196D9B1Ee3411a4C6E26a417861713151EcdC07' }}
+          # Mainnet LaunchFactoryV2 — comma-separated list (new v2.1 + legacy). Scans BOTH so existing
+          # v2 dividend vaults keep getting served. Override via repo variable (KEEP BOTH addresses!).
+          LAUNCH_FACTORY_V2: ${{ vars.LAUNCH_FACTORY_V2 || '0xaDeb3eaEbA2fE20Afdb20529382e4395FaA2821c,0x2196D9B1Ee3411a4C6E26a417861713151EcdC07' }}
           # Dead-token filter: skip launches whose pool WBNB < this many BNB (default 2). Set repo var to tune.
           MIN_POOL_BNB: ${{ vars.MIN_POOL_BNB || '2' }}
           # Manual skip list: comma-separated token addresses to always ignore. Set repo var SKIP_TOKENS.
