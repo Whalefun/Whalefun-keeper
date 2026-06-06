@@ -18,7 +18,9 @@ import { ethers } from "ethers";
 const RPC = process.env.RPC_URL || "https://bsc-rpc.publicnode.com";
 // 私钥归一化:带不带 0x 前缀都能用(去空格、缺 0x 自动补)。
 const PK = (() => { const k = (process.env.KEEPER_PK || "").trim(); return k ? (k.startsWith("0x") ? k : "0x" + k) : k; })();
-const FACTORY = process.env.LAUNCH_FACTORY_V2;
+// 可配多个工厂(升级后新+旧并存,逗号/空格分隔)。旧 v2 币的分红金库在旧工厂,必须一起扫,否则停发。
+const FACTORIES = (process.env.LAUNCH_FACTORY_V2 || "")
+  .split(/[\s,;]+/).map((s) => s.trim()).filter(Boolean);
 // 跳过名单:死币/废弃币的【代币地址】,逗号分隔。在仓库 Variables 里配 SKIP_TOKENS,改名单不用动代码。
 const SKIP = new Set(
   (process.env.SKIP_TOKENS || "").split(/[\s,;]+/).map((s) => s.trim().toLowerCase()).filter(Boolean)
@@ -35,8 +37,8 @@ const MIN_OWED = BigInt(process.env.MIN_OWED_WEI || "100000000000000"); // 1e14
 const BATCH = Number(process.env.BATCH || "100");
 const INTERVAL_MS = Number(process.env.INTERVAL_MS || "300000");
 
-if (!PK || !FACTORY) {
-  console.error("缺少 KEEPER_PK 或 LAUNCH_FACTORY_V2 环境变量");
+if (!PK || FACTORIES.length === 0) {
+  console.error("缺少 KEEPER_PK 或 LAUNCH_FACTORY_V2 环境变量(后者可填多个,逗号分隔)");
   process.exit(1);
 }
 
@@ -135,10 +137,10 @@ async function processVault(vaultAddr) {
   }
 }
 
-async function runOnce() {
-  const factory = new ethers.Contract(FACTORY, FACTORY_ABI, provider);
+async function processFactory(factoryAddr) {
+  const factory = new ethers.Contract(factoryAddr, FACTORY_ABI, provider);
   const count = Number(await factory.launchCount());
-  console.log(`扫描 ${count} 个 v2 代币 · keeper ${wallet.address}`);
+  console.log(`扫描工厂 ${factoryAddr} 的 ${count} 个 v2 代币 · keeper ${wallet.address}`);
   for (let i = 0; i < count; i++) {
     let info;
     try {
@@ -168,6 +170,14 @@ async function runOnce() {
     try { await processToken(info.token); } catch (e) { console.error(`launch #${i} token:`, e.shortMessage || e.message); }
     // 分红金库 = taxVault(索引2),不是 vault(索引1,那是 LP 托管金库,没有 snowball)。
     try { await processVault(info.taxVault); } catch (e) { console.error(`launch #${i} vault:`, e.shortMessage || e.message); }
+  }
+}
+
+async function runOnce() {
+  // 遍历所有工厂(新+旧),任一工厂报错不影响其它工厂。
+  for (const f of FACTORIES) {
+    try { await processFactory(f); }
+    catch (e) { console.error(`工厂 ${f} 扫描失败:`, e.shortMessage || e.message); }
   }
   console.log("本轮完成");
 }
