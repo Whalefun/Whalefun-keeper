@@ -65,6 +65,23 @@ const VAULT_ABI = [
 ];
 const PER_LEG = BigInt(process.env.VAULT_PER_LEG_WEI || "10000000000000000"); // 0.01 BNB(每池满才派发)
 
+// LP 质押分红金库专用(其它金库没有这些方法 → revert → try/catch 跳过)。keeper 只做"跨档升级 poke"。
+const LP_VAULT_ABI = [
+  "function stakerCount() view returns (uint256)",
+  "function getStakers(uint256,uint256) view returns (address[])",
+  "function userInfo(address) view returns (uint256 amount,uint256 effShare,uint256 rewardDebt,uint256 stakeStart)",
+  "function pokeMany(address[])",
+];
+// 合约里的时间档(秒 → 总有效倍率 bps),keeper 用来判断谁跨档了、只 poke 需要的人,省 gas。
+function multBps(durSec) {
+  if (durSec < 3 * 3600) return 10000n;
+  if (durSec < 7 * 3600) return 13000n;
+  if (durSec < 24 * 3600) return 15000n;
+  if (durSec < 3 * 86400) return 20000n;
+  if (durSec < 7 * 86400) return 25000n;
+  return 30000n;
+}
+
 const provider = new ethers.JsonRpcProvider(RPC, undefined, { batchMaxCount: 1 });
 const wallet = new ethers.Wallet(PK, provider);
 
@@ -140,6 +157,7 @@ async function processVault(vaultAddr) {
 async function processFactory(factoryAddr) {
   const factory = new ethers.Contract(factoryAddr, FACTORY_ABI, provider);
   const count = Number(await factory.launchCount());
+  const nowTs = Number((await provider.getBlock("latest")).timestamp); // LP 金库判档用链上时间
   console.log(`扫描工厂 ${factoryAddr} 的 ${count} 个 v2 代币 · keeper ${wallet.address}`);
   for (let i = 0; i < count; i++) {
     let info;
@@ -170,6 +188,42 @@ async function processFactory(factoryAddr) {
     try { await processToken(info.token); } catch (e) { console.error(`launch #${i} token:`, e.shortMessage || e.message); }
     // 分红金库 = taxVault(索引2),不是 vault(索引1,那是 LP 托管金库,没有 snowball)。
     try { await processVault(info.taxVault); } catch (e) { console.error(`launch #${i} vault:`, e.shortMessage || e.message); }
+    // LP 质押分红金库:升档 poke(非 LP 金库会被静默跳过)。
+    try { await processLPVault(info.taxVault, nowTs); } catch (e) { console.error(`launch #${i} LP vault:`, e.shortMessage || e.message); }
+  }
+}
+
+// LP 质押分红金库:遍历质押者,只给"已跨档但还没升级"的人 poke(分批),把时间加成升到位。
+// 非 LP 金库(无 stakerCount)→ 第一行就 revert → 静默跳过。keeper 挂了也不丢钱,用户 claim 时自动升级。
+async function processLPVault(vaultAddr, nowTs) {
+  if (!vaultAddr || vaultAddr === ethers.ZeroAddress) return;
+  const v = new ethers.Contract(vaultAddr, LP_VAULT_ABI, wallet);
+  let n;
+  try { n = Number(await v.stakerCount()); } catch { return; } // 非 LP 金库
+  if (n === 0) return;
+  const need = [];
+  for (let i = 0; i < n; i += 100) {
+    let addrs;
+    try { addrs = await v.getStakers(i, 100); } catch { break; }
+    const infos = await Promise.allSettled(addrs.map((a) => v.userInfo(a)));
+    infos.forEach((r, k) => {
+      if (r.status !== "fulfilled") return;
+      const { amount, effShare, stakeStart } = r.value;
+      if (amount === 0n || stakeStart === 0n) return;            // 已退出
+      const appliedBps = (effShare * 10000n) / amount;            // 当前计酬倍率
+      const curBps = multBps(nowTs - Number(stakeStart));         // 应有倍率
+      if (curBps > appliedBps) need.push(addrs[k]);               // 跨档没升 → 要 poke
+    });
+  }
+  if (need.length === 0) { console.log(`[LP vault ${vaultAddr}] ${n} 质押者,无人需升档`); return; }
+  for (let i = 0; i < need.length; i += 100) {
+    const slice = need.slice(i, i + 100);
+    try {
+      const rc = await (await v.pokeMany(slice, { gasLimit: 3000000 })).wait();
+      console.log(`[LP vault ${vaultAddr}] pokeMany ${slice.length} 人升档 ✅ tx ${rc.hash}`);
+    } catch (e) {
+      console.error(`[LP vault ${vaultAddr}] pokeMany 失败:`, e.shortMessage || e.message);
+    }
   }
 }
 
