@@ -85,6 +85,15 @@ function multBps(durSec) {
 const provider = new ethers.JsonRpcProvider(RPC, undefined, { batchMaxCount: 1 });
 const wallet = new ethers.Wallet(PK, provider);
 
+// 本轮时间预算:到点就干净收尾、exit 0(剩余代币下一轮继续),绝不被 GitHub 的 timeout-minutes 硬掐成 failed。
+// keeper 本就是 best-effort,漏跑只是延迟,用户随时可自领 → 提前结束完全安全。默认 12 分钟(工作流给 15 分钟留余量)。
+const DEADLINE_MS = Number(process.env.DEADLINE_MS || 12 * 60 * 1000);
+const startedAt = Date.now();
+const timeUp = () => Date.now() - startedAt > DEADLINE_MS;
+// 每笔交易最多等 90s 确认,防单个 tx.wait() 卡死(RPC 抽风)吃光整轮预算。超时按失败处理,下轮重试。
+const WAIT_CONFIRMS = 1;
+const WAIT_TIMEOUT_MS = 90_000;
+
 async function processToken(tokenAddr) {
   const token = new ethers.Contract(tokenAddr, TOKEN_ABI, wallet);
   if ((await token.startTradeBlock()) === 0n) return; // 未开盘,无分红
@@ -107,10 +116,11 @@ async function processToken(tokenAddr) {
 
   // 分批 distributeTo
   for (let i = 0; i < owed.length; i += BATCH) {
+    if (timeUp()) { console.log(`[${tokenAddr}] 时间预算用尽,distributeTo 余下 ${owed.length - i} 人下轮继续`); break; }
     const slice = owed.slice(i, i + BATCH);
     try {
       const tx = await token.distributeTo(slice);
-      const rc = await tx.wait();
+      const rc = await tx.wait(WAIT_CONFIRMS, WAIT_TIMEOUT_MS);
       console.log(`[${tokenAddr}] distributeTo ${slice.length} 个 → tx ${rc.hash}`);
     } catch (e) {
       console.error(`[${tokenAddr}] distributeTo 失败:`, e.shortMessage || e.message);
@@ -126,7 +136,7 @@ async function processVault(vaultAddr) {
   // 1. 冷启动:totalShares=0(oracle 未同步)时同步一次
   try {
     if ((await vault.totalShares()) === 0n) {
-      const rc = await (await vault.syncPlatformDividend()).wait();
+      const rc = await (await vault.syncPlatformDividend()).wait(WAIT_CONFIRMS, WAIT_TIMEOUT_MS);
       console.log(`[vault ${vaultAddr}] syncPlatformDividend → tx ${rc.hash}`);
     }
   } catch { /* 非 DWC 金库 / 无此方法 → 跳过 */ }
@@ -147,7 +157,7 @@ async function processVault(vaultAddr) {
   try {
     // 显式高 gas:两条腿(尤其买 $WHALE 这种带税+分红的复杂币)实测 ~1.07M,合约还有 gasleft 地板,
     // 给 2M 留足余量(用不完自动退,只按实际用量计费)。
-    const rc = await (await vault.snowball({ gasLimit: 2000000 })).wait();
+    const rc = await (await vault.snowball({ gasLimit: 2000000 })).wait(WAIT_CONFIRMS, WAIT_TIMEOUT_MS);
     console.log(`[vault ${vaultAddr}] snowball ✅ → tx ${rc.hash}`);
   } catch (e) {
     console.error(`[vault ${vaultAddr}] snowball 失败:`, e.shortMessage || e.message);
@@ -160,6 +170,7 @@ async function processFactory(factoryAddr) {
   const nowTs = Number((await provider.getBlock("latest")).timestamp); // LP 金库判档用链上时间
   console.log(`扫描工厂 ${factoryAddr} 的 ${count} 个 v2 代币 · keeper ${wallet.address}`);
   for (let i = 0; i < count; i++) {
+    if (timeUp()) { console.log(`⏱ 本轮时间预算用尽,已处理至 #${i}/${count}(工厂 ${factoryAddr}),剩余下轮继续`); break; }
     let info;
     try {
       info = await factory.launches(i);
@@ -217,9 +228,10 @@ async function processLPVault(vaultAddr, nowTs) {
   }
   if (need.length === 0) { console.log(`[LP vault ${vaultAddr}] ${n} 质押者,无人需升档`); return; }
   for (let i = 0; i < need.length; i += 100) {
+    if (timeUp()) { console.log(`[LP vault ${vaultAddr}] 时间预算用尽,pokeMany 余下下轮继续`); break; }
     const slice = need.slice(i, i + 100);
     try {
-      const rc = await (await v.pokeMany(slice, { gasLimit: 3000000 })).wait();
+      const rc = await (await v.pokeMany(slice, { gasLimit: 3000000 })).wait(WAIT_CONFIRMS, WAIT_TIMEOUT_MS);
       console.log(`[LP vault ${vaultAddr}] pokeMany ${slice.length} 人升档 ✅ tx ${rc.hash}`);
     } catch (e) {
       console.error(`[LP vault ${vaultAddr}] pokeMany 失败:`, e.shortMessage || e.message);
