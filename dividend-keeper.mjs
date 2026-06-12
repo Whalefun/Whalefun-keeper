@@ -72,6 +72,13 @@ const LP_VAULT_ABI = [
   "function userInfo(address) view returns (uint256 amount,uint256 effShare,uint256 rewardDebt,uint256 stakeStart)",
   "function pokeMany(address[])",
 ];
+// 储备代币托底(Floor)金库专用。floor() 赎回不会自动买储备币,只有 buyPendingReserve() 会把
+// 积累的税费 BNB 换成储备币、推高底价 → 必须 keeper 周期驱动,否则底池永远不积累。
+// vaultStatus() 作类型探针:非 Floor 金库无此方法 → revert → 静默跳过。
+const FLOOR_VAULT_ABI = [
+  "function vaultStatus() view returns (uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256,bool)",
+  "function buyPendingReserve()",
+];
 // 合约里的时间档(秒 → 总有效倍率 bps),keeper 用来判断谁跨档了、只 poke 需要的人,省 gas。
 function multBps(durSec) {
   if (durSec < 3 * 3600) return 10000n;
@@ -201,6 +208,8 @@ async function processFactory(factoryAddr) {
     try { await processVault(info.taxVault); } catch (e) { console.error(`launch #${i} vault:`, e.shortMessage || e.message); }
     // LP 质押分红金库:升档 poke(非 LP 金库会被静默跳过)。
     try { await processLPVault(info.taxVault, nowTs); } catch (e) { console.error(`launch #${i} LP vault:`, e.shortMessage || e.message); }
+    // 储备托底(Floor)金库:把待买 BNB 换成储备币(非 Floor 金库会被静默跳过)。
+    try { await processFloorVault(info.taxVault); } catch (e) { console.error(`launch #${i} Floor vault:`, e.shortMessage || e.message); }
   }
 }
 
@@ -236,6 +245,24 @@ async function processLPVault(vaultAddr, nowTs) {
     } catch (e) {
       console.error(`[LP vault ${vaultAddr}] pokeMany 失败:`, e.shortMessage || e.message);
     }
+  }
+}
+
+// 储备代币托底(Floor)金库:把积累的税费 BNB 换成储备币,推高底价。
+// vaultStatus() 作类型探针:非 Floor 金库无此方法 → revert → 静默跳过。
+// 余额 < PER_LEG 不动手(避免 dust swap 浪费 gas);buyPendingReserve 自带 nonReentrant + 失败 BNB 留库。
+async function processFloorVault(vaultAddr) {
+  if (!vaultAddr || vaultAddr === ethers.ZeroAddress) return;
+  const v = new ethers.Contract(vaultAddr, FLOOR_VAULT_ABI, wallet);
+  try { await v.vaultStatus(); } catch { return; } // 非 Floor 金库
+  let bal;
+  try { bal = await provider.getBalance(vaultAddr); } catch { return; }
+  if (bal < PER_LEG) { console.log(`[Floor vault ${vaultAddr}] 待买 ${ethers.formatEther(bal)} BNB < ${ethers.formatEther(PER_LEG)},跳过`); return; }
+  try {
+    const rc = await (await v.buyPendingReserve({ gasLimit: 1500000 })).wait(WAIT_CONFIRMS, WAIT_TIMEOUT_MS);
+    console.log(`[Floor vault ${vaultAddr}] buyPendingReserve ${ethers.formatEther(bal)} BNB ✅ tx ${rc.hash}`);
+  } catch (e) {
+    console.error(`[Floor vault ${vaultAddr}] buyPendingReserve 失败:`, e.shortMessage || e.message);
   }
 }
 
