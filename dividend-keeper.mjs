@@ -89,6 +89,25 @@ function multBps(durSec) {
   return 30000n;
 }
 
+// 持币时间加权分红金库专用(holderCount/getHolders/userInfo(...,holdStart)/pokeMany)。
+// 钻石手长期持有不交易 → 时间倍率涨了但 effShare 还是旧档 → keeper 帮其 poke 升档拿到应得权重。
+// 非该类金库(无 holderCount)→ revert → 静默跳过。keeper 挂了不丢钱(用户 claim/转账时自动升档)。
+const HTW_VAULT_ABI = [
+  "function holderCount() view returns (uint256)",
+  "function getHolders(uint256,uint256) view returns (address[])",
+  "function userInfo(address) view returns (uint256 amount,uint256 effShare,uint256 rewardDebt,uint256 holdStart)",
+  "function pokeMany(address[])",
+];
+// HTW 金库的时间档(中等尺度,与合约一致):<6h 1× / <1d 1.2× / <3d 1.5× / <7d 2× / <14d 2.5× / ≥14d 3×。
+function multBpsHTW(durSec) {
+  if (durSec < 6 * 3600) return 10000n;
+  if (durSec < 86400) return 12000n;
+  if (durSec < 3 * 86400) return 15000n;
+  if (durSec < 7 * 86400) return 20000n;
+  if (durSec < 14 * 86400) return 25000n;
+  return 30000n;
+}
+
 const provider = new ethers.JsonRpcProvider(RPC, undefined, { batchMaxCount: 1 });
 const wallet = new ethers.Wallet(PK, provider);
 
@@ -210,6 +229,8 @@ async function processFactory(factoryAddr) {
     try { await processLPVault(info.taxVault, nowTs); } catch (e) { console.error(`launch #${i} LP vault:`, e.shortMessage || e.message); }
     // 储备托底(Floor)金库:把待买 BNB 换成储备币(非 Floor 金库会被静默跳过)。
     try { await processFloorVault(info.taxVault); } catch (e) { console.error(`launch #${i} Floor vault:`, e.shortMessage || e.message); }
+    // 持币时间加权分红金库:升档 poke(非该类金库会被静默跳过)。
+    try { await processHTWVault(info.taxVault, nowTs); } catch (e) { console.error(`launch #${i} HTW vault:`, e.shortMessage || e.message); }
   }
 }
 
@@ -263,6 +284,41 @@ async function processFloorVault(vaultAddr) {
     console.log(`[Floor vault ${vaultAddr}] buyPendingReserve ${ethers.formatEther(bal)} BNB ✅ tx ${rc.hash}`);
   } catch (e) {
     console.error(`[Floor vault ${vaultAddr}] buyPendingReserve 失败:`, e.shortMessage || e.message);
+  }
+}
+
+// 持币时间加权分红金库:遍历持有人,只给"已跨档但还没升级"的人 poke(分批),把时间倍率升到位。
+// 非该类金库(无 holderCount)→ 第一行就 revert → 静默跳过。
+async function processHTWVault(vaultAddr, nowTs) {
+  if (!vaultAddr || vaultAddr === ethers.ZeroAddress) return;
+  const v = new ethers.Contract(vaultAddr, HTW_VAULT_ABI, wallet);
+  let n;
+  try { n = Number(await v.holderCount()); } catch { return; } // 非 HTW 金库
+  if (n === 0) return;
+  const need = [];
+  for (let i = 0; i < n; i += 100) {
+    let addrs;
+    try { addrs = await v.getHolders(i, 100); } catch { break; }
+    const infos = await Promise.allSettled(addrs.map((a) => v.userInfo(a)));
+    infos.forEach((r, k) => {
+      if (r.status !== "fulfilled") return;
+      const { amount, effShare, holdStart } = r.value;
+      if (amount === 0n || holdStart === 0n) return;            // 已清零/卖光
+      const appliedBps = (effShare * 10000n) / amount;          // 当前计酬倍率
+      const curBps = multBpsHTW(nowTs - Number(holdStart));     // 应有倍率
+      if (curBps > appliedBps) need.push(addrs[k]);             // 跨档没升 → 要 poke
+    });
+  }
+  if (need.length === 0) { console.log(`[HTW vault ${vaultAddr}] ${n} 持有人,无人需升档`); return; }
+  for (let i = 0; i < need.length; i += 100) {
+    if (timeUp()) { console.log(`[HTW vault ${vaultAddr}] 时间预算用尽,pokeMany 余下下轮继续`); break; }
+    const slice = need.slice(i, i + 100);
+    try {
+      const rc = await (await v.pokeMany(slice, { gasLimit: 3000000 })).wait(WAIT_CONFIRMS, WAIT_TIMEOUT_MS);
+      console.log(`[HTW vault ${vaultAddr}] pokeMany ${slice.length} 人升档 ✅ tx ${rc.hash}`);
+    } catch (e) {
+      console.error(`[HTW vault ${vaultAddr}] pokeMany 失败:`, e.shortMessage || e.message);
+    }
   }
 }
 
