@@ -126,6 +126,7 @@ const PAIR_TRANSFER_ABI = [
 ];
 // 每轮回扫多少区块找新 LP 持有人(BSC ~3s/块;默认 5000 ≈ 4 小时)。keeper 跑得勤就能很快登记到。
 const LPHOLDER_SCAN_BLOCKS = Number(process.env.LPHOLDER_SCAN_BLOCKS || "5000");
+const LOG_CHUNK = Number(process.env.LOG_CHUNK || "2000"); // 单次 getLogs 区块上限(Alchemy 约 2000;分块扫,兼容各节点范围限制)
 const LPHOLDER_REWARD_GAS = BigInt(process.env.LPHOLDER_REWARD_GAS || "2000000"); // processReward 内部轮询 gas 预算
 const DEAD_ADDR = "0x000000000000000000000000000000000000dead";
 
@@ -360,7 +361,12 @@ async function processLPHolderVault(vaultAddr) {
     const latest = await provider.getBlockNumber();
     const fromB = Math.max(0, latest - LPHOLDER_SCAN_BLOCKS);
     const pair = new ethers.Contract(lp, PAIR_TRANSFER_ABI, provider);
-    const logs = await pair.queryFilter(pair.filters.Transfer(), fromB, latest);
+    const logs = [];
+    for (let lo = fromB; lo <= latest; lo += LOG_CHUNK) {
+      const hi = Math.min(lo + LOG_CHUNK - 1, latest);
+      try { logs.push(...await pair.queryFilter(pair.filters.Transfer(), lo, hi)); }
+      catch (ce) { console.log(`[LPHolder ${vaultAddr}] 扫块 ${lo}-${hi} 跳过:${ce.shortMessage || ce.message}`); }
+    }
     const cands = new Set();
     for (const lg of logs) { if (lg.args) { cands.add(lg.args[0]); cands.add(lg.args[1]); } }
     const existing = new Set();
