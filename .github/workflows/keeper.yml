@@ -42,8 +42,10 @@ jobs:
       - name: Run keeper (one round)
         env:
           KEEPER_PK: ${{ secrets.KEEPER_PK }}
-          # Reliable BSC mainnet RPC; override with repo variable RPC_URL if needed.
-          RPC_URL: ${{ vars.RPC_URL || 'https://bsc-dataseed.bnbchain.org' }}
+          # BSC mainnet RPC. 默认公共节点不支持 eth_getLogs → 「持有 LP 分红」金库无法自动登记新 LP 持有人。
+          # 要自动登记:把 RPC_URL 设成支持 getLogs 的端点(如 Alchemy BSC)。⚠️ Alchemy URL 含 API key,
+          # 必须放 Secret(secrets.RPC_URL),别放公开仓库的 Variable(会泄露 key)。无 getLogs 时退化为用户手动 syncLPHolder。
+          RPC_URL: ${{ secrets.RPC_URL || vars.RPC_URL || 'https://bsc-dataseed.bnbchain.org' }}
           # Mainnet LaunchFactoryV2 — comma-separated list. Scans ALL so every factory's vaults keep
           # getting served: v2.2 (0x1230) + two legacy + v2.4 (0xB5AF = USDT + 持有 LP 分红 金库).
           # Override via repo variable ONLY IF you include EVERY address below (a variable replaces this default).
