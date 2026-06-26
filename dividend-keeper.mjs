@@ -132,6 +132,11 @@ const DEAD_ADDR = "0x000000000000000000000000000000000000dead";
 
 const provider = new ethers.JsonRpcProvider(RPC, undefined, { batchMaxCount: 1 });
 const wallet = new ethers.Wallet(PK, provider);
+// 专用 getLogs 端点(可选,如 Alchemy BSC):只给「持有 LP 分红」自动登记扫 LP Transfer 用,与主 RPC 隔离。
+// 不设 → 自动登记整段跳过(主 RPC 多不支持/会限流 getLogs,挂在主流程上会拖垮整轮)。
+const logsProvider = process.env.LOGS_RPC_URL
+  ? new ethers.JsonRpcProvider(process.env.LOGS_RPC_URL, undefined, { batchMaxCount: 1 })
+  : null;
 
 // 本轮时间预算:到点就干净收尾、exit 0(剩余代币下一轮继续),绝不被 GitHub 的 timeout-minutes 硬掐成 failed。
 // keeper 本就是 best-effort,漏跑只是延迟,用户随时可自领 → 提前结束完全安全。默认 12 分钟(工作流给 15 分钟留余量)。
@@ -355,12 +360,14 @@ async function processLPHolderVault(vaultAddr) {
   try { cond = await v.holderRewardCondition(); } catch { return; } // 非 LPHolder 金库
   try { quote = await v.quoteToken(); } catch { quote = ethers.ZeroAddress; }
 
-  // ① 登记新 LP 持有人(扫最近区块的 LP Transfer;失败则跳过,用户可自行 syncLPHolder 兜底)
-  try {
+  // ① 自动登记新 LP 持有人 —— 仅当配置了专用 getLogs 端点(LOGS_RPC_URL,如 Alchemy)才扫。
+  //    未配置则整段跳过:主 RPC 多不支持/会限流 getLogs,扫描挂主流程会拖垮整轮(曾把 keeper 从 30s 拖到 15min 撞超时)。
+  //    跳过不影响派发;LP 持有人用详情页「登记领分红」(syncLPHolder)自行登记即可。
+  if (logsProvider) try {
     const lp = await v.lpToken();
-    const latest = await provider.getBlockNumber();
+    const latest = await logsProvider.getBlockNumber();
     const fromB = Math.max(0, latest - LPHOLDER_SCAN_BLOCKS);
-    const pair = new ethers.Contract(lp, PAIR_TRANSFER_ABI, provider);
+    const pair = new ethers.Contract(lp, PAIR_TRANSFER_ABI, logsProvider);
     const logs = [];
     for (let lo = fromB; lo <= latest; lo += LOG_CHUNK) {
       const hi = Math.min(lo + LOG_CHUNK - 1, latest);
