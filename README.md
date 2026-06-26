@@ -18,8 +18,10 @@ Everything it calls is **permissionless** — the hot wallet only pays gas and h
 
 ### Optional repo Variables (Settings → Variables)
 - `RPC_URL` — BSC mainnet RPC (default: `https://bsc-dataseed.bnbchain.org`)
-- `LAUNCH_FACTORY_V2` — default: `0x2196D9B1Ee3411a4C6E26a417861713151EcdC07` (mainnet v2 factory)
-- Script-level (env): `MIN_OWED_WEI`, `BATCH`, `VAULT_PER_LEG_WEI` — see `dividend-keeper.mjs`.
+- `LAUNCH_FACTORY_V2` — factory address(es), **comma-separated** (scans all). **你通常不用设它** —— `keeper.yml` 的默认值已经包含了全部工厂(v2.2 + 两个 legacy + v2.4 `0xB5AF…`,「持有 LP 分红」/USDT 金库在此)。
+  - ⚠️ 设了这个变量会**整个覆盖**默认值,所以要设就必须把**全部**地址都写上,漏一个那个工厂下的金库就会停派:
+  - `0x1230B67525247DA20e56E9f8CAaA263ae670401a,0xaDeb3eaEbA2fE20Afdb20529382e4395FaA2821c,0x2196D9B1Ee3411a4C6E26a417861713151EcdC07,0xB5AF6387ed653F3f15C01Da4031571Fd454DF22f`
+- Script-level (env): `MIN_OWED_WEI`, `BATCH`, `VAULT_PER_LEG_WEI`, `LPHOLDER_SCAN_BLOCKS`(持有 LP 分红:每轮回扫多少区块找新 LP 持有人,默认 5000) — see `dividend-keeper.mjs`.
 
 ## Run locally (optional)
 ```bash
