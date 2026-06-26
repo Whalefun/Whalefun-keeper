@@ -17,7 +17,10 @@ Everything it calls is **permissionless** — the hot wallet only pays gas and h
 4. Push. It runs automatically (~every 10 min) and can be run manually from the **Actions** tab → *dividend-keeper* → *Run workflow*.
 
 ### Optional repo Variables (Settings → Variables)
-- `RPC_URL` — BSC mainnet RPC (default: `https://bsc-dataseed.bnbchain.org`)
+- `RPC_URL` — BSC mainnet RPC (default: `https://bsc-dataseed.bnbchain.org`)。
+  - ⚠️ **「持有 LP 分红」金库自动登记需要 `eth_getLogs`**,公共节点(bsc-dataseed 等)不支持 → 自动登记失效,LP 持有人须手动 `syncLPHolder`。要自动登记:把 RPC 设成支持 getLogs 的端点(如 **Alchemy BSC**)。
+  - 🔒 Alchemy URL 含 API key,**放 Secret 名为 `RPC_URL`(Settings → Secrets),不要放 Variable**(公开仓库会泄露 key)。keeper.yml 已优先读 `secrets.RPC_URL`。
+  - 扫描已分块(`LOG_CHUNK` 默认 2000 区块/次),兼容 Alchemy 范围上限。
 - `LAUNCH_FACTORY_V2` — factory address(es), **comma-separated** (scans all). **你通常不用设它** —— `keeper.yml` 的默认值已经包含了全部工厂(v2.2 + 两个 legacy + v2.4 `0xB5AF…`,「持有 LP 分红」/USDT 金库在此)。
   - ⚠️ 设了这个变量会**整个覆盖**默认值,所以要设就必须把**全部**地址都写上,漏一个那个工厂下的金库就会停派:
   - `0x1230B67525247DA20e56E9f8CAaA263ae670401a,0xaDeb3eaEbA2fE20Afdb20529382e4395FaA2821c,0x2196D9B1Ee3411a4C6E26a417861713151EcdC07,0xB5AF6387ed653F3f15C01Da4031571Fd454DF22f`
