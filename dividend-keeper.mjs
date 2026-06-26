@@ -108,6 +108,27 @@ function multBpsHTW(durSec) {
   return 30000n;
 }
 
+// 持有 LP 分红金库(LPHolderDividendVaultU)专用。它【不被 token 推送】(无 setShare),持有人名单只能由
+// keeper / 用户自登记维护。keeper 干两件事:① 扫最近 LP Transfer 把新 LP 持有人 addHolders 登记进去;
+// ② 池子达门槛就 processReward 按 LP 比例派发(BNB/USDT)。holderRewardCondition() 作类型探针(独有 → 非该类金库 revert 跳过)。
+const LP_HOLDER_VAULT_ABI = [
+  "function holderRewardCondition() view returns (uint256)",
+  "function quoteToken() view returns (address)",
+  "function lpToken() view returns (address)",
+  "function holderCount() view returns (uint256)",
+  "function getHolders(uint256,uint256) view returns (address[])",
+  "function addHolders(address[])",
+  "function processReward(uint256)",
+];
+const PAIR_TRANSFER_ABI = [
+  "event Transfer(address indexed from, address indexed to, uint256 value)",
+  "function balanceOf(address) view returns (uint256)",
+];
+// 每轮回扫多少区块找新 LP 持有人(BSC ~3s/块;默认 5000 ≈ 4 小时)。keeper 跑得勤就能很快登记到。
+const LPHOLDER_SCAN_BLOCKS = Number(process.env.LPHOLDER_SCAN_BLOCKS || "5000");
+const LPHOLDER_REWARD_GAS = BigInt(process.env.LPHOLDER_REWARD_GAS || "2000000"); // processReward 内部轮询 gas 预算
+const DEAD_ADDR = "0x000000000000000000000000000000000000dead";
+
 const provider = new ethers.JsonRpcProvider(RPC, undefined, { batchMaxCount: 1 });
 const wallet = new ethers.Wallet(PK, provider);
 
@@ -231,6 +252,8 @@ async function processFactory(factoryAddr) {
     try { await processFloorVault(info.taxVault); } catch (e) { console.error(`launch #${i} Floor vault:`, e.shortMessage || e.message); }
     // 持币时间加权分红金库:升档 poke(非该类金库会被静默跳过)。
     try { await processHTWVault(info.taxVault, nowTs); } catch (e) { console.error(`launch #${i} HTW vault:`, e.shortMessage || e.message); }
+    // 持有 LP 分红金库:登记新 LP 持有人 + 派发(非该类金库会被静默跳过)。
+    try { await processLPHolderVault(info.taxVault); } catch (e) { console.error(`launch #${i} LPHolder vault:`, e.shortMessage || e.message); }
   }
 }
 
@@ -319,6 +342,59 @@ async function processHTWVault(vaultAddr, nowTs) {
     } catch (e) {
       console.error(`[HTW vault ${vaultAddr}] pokeMany 失败:`, e.shortMessage || e.message);
     }
+  }
+}
+
+// 持有 LP 分红金库:① 扫最近 LP Transfer 登记新持有人(best-effort);② 池达门槛就按 LP 比例派发报价币。
+// 非该类金库(无 holderRewardCondition)→ 第一行 revert → 静默跳过。RPC 不支持 getLogs 时登记跳过,靠用户自登记兜底。
+async function processLPHolderVault(vaultAddr) {
+  if (!vaultAddr || vaultAddr === ethers.ZeroAddress) return;
+  const v = new ethers.Contract(vaultAddr, LP_HOLDER_VAULT_ABI, wallet);
+  let cond, quote;
+  try { cond = await v.holderRewardCondition(); } catch { return; } // 非 LPHolder 金库
+  try { quote = await v.quoteToken(); } catch { quote = ethers.ZeroAddress; }
+
+  // ① 登记新 LP 持有人(扫最近区块的 LP Transfer;失败则跳过,用户可自行 syncLPHolder 兜底)
+  try {
+    const lp = await v.lpToken();
+    const latest = await provider.getBlockNumber();
+    const fromB = Math.max(0, latest - LPHOLDER_SCAN_BLOCKS);
+    const pair = new ethers.Contract(lp, PAIR_TRANSFER_ABI, provider);
+    const logs = await pair.queryFilter(pair.filters.Transfer(), fromB, latest);
+    const cands = new Set();
+    for (const lg of logs) { if (lg.args) { cands.add(lg.args[0]); cands.add(lg.args[1]); } }
+    const existing = new Set();
+    const hn = Number(await v.holderCount());
+    for (let i = 0; i < hn; i += 200) { try { (await v.getHolders(i, 200)).forEach((a) => existing.add(a.toLowerCase())); } catch { break; } }
+    const skip = new Set([ethers.ZeroAddress.toLowerCase(), DEAD_ADDR, lp.toLowerCase(), vaultAddr.toLowerCase()]);
+    const lpRead = new ethers.Contract(lp, ["function balanceOf(address) view returns (uint256)"], provider);
+    const toAdd = [];
+    for (const a of cands) {
+      const al = a.toLowerCase();
+      if (skip.has(al) || existing.has(al)) continue;
+      let b; try { b = await lpRead.balanceOf(a); } catch { continue; }
+      if (b > 0n) toAdd.push(a);
+    }
+    for (let i = 0; i < toAdd.length; i += 100) {
+      if (timeUp()) break;
+      const slice = toAdd.slice(i, i + 100);
+      const rc = await (await v.addHolders(slice, { gasLimit: 4000000 })).wait(WAIT_CONFIRMS, WAIT_TIMEOUT_MS);
+      console.log(`[LPHolder ${vaultAddr}] addHolders ${slice.length} 个新 LP 持有人 ✅ tx ${rc.hash}`);
+    }
+  } catch (e) {
+    console.log(`[LPHolder ${vaultAddr}] 登记跳过(getLogs 不支持/无新增):${e.shortMessage || e.message}`);
+  }
+
+  // ② 派发(池子达门槛才调,省 gas;报价币 BNB 看 this.balance / ERC20 看 balanceOf)
+  try {
+    const pot = (quote === ethers.ZeroAddress)
+      ? await provider.getBalance(vaultAddr)
+      : await new ethers.Contract(quote, ["function balanceOf(address) view returns (uint256)"], provider).balanceOf(vaultAddr);
+    if (pot < cond) { console.log(`[LPHolder ${vaultAddr}] 池 ${ethers.formatEther(pot)} < 门槛 ${ethers.formatEther(cond)},跳过派发`); return; }
+    const rc = await (await v.processReward(LPHOLDER_REWARD_GAS, { gasLimit: 3000000 })).wait(WAIT_CONFIRMS, WAIT_TIMEOUT_MS);
+    console.log(`[LPHolder ${vaultAddr}] processReward 派发 ✅ tx ${rc.hash}`);
+  } catch (e) {
+    console.error(`[LPHolder ${vaultAddr}] processReward 失败:`, e.shortMessage || e.message);
   }
 }
 
