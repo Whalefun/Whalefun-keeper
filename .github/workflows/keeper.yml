@@ -49,6 +49,10 @@ jobs:
           # 不设 → 跳过自动登记(LP 持有人用详情页「登记领分红」自行登记,推荐保持不设)。
           # 要自动登记才设成支持 getLogs 的 Alchemy BSC;含 API key,放 Secret(secrets.LOGS_RPC_URL)别放公开 Variable。
           LOGS_RPC_URL: ${{ secrets.LOGS_RPC_URL || vars.LOGS_RPC_URL || '' }}
+          # 自动登记的扫块窗口(默认 5000 块≈1小时,增量足够)。首次启用自动登记时:临时把 repo Variable
+          # LPHOLDER_SCAN_BLOCKS 设大(如 2000000 ≈ 17 天)→ Actions 手动跑一轮回补老 LP 持有人 → 跑完删除该
+          # Variable 恢复默认,避免每轮都全量扫。
+          LPHOLDER_SCAN_BLOCKS: ${{ vars.LPHOLDER_SCAN_BLOCKS || '5000' }}
           # Mainnet LaunchFactoryV2 — comma-separated list. Scans ALL so every factory's vaults keep
           # getting served: v2.2 (0x1230) + two legacy + v2.4 (0xB5AF = USDT + 持有 LP 分红 金库).
           # Override via repo variable ONLY IF you include EVERY address below (a variable replaces this default).
