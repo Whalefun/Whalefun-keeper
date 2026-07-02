@@ -369,10 +369,24 @@ async function processLPHolderVault(vaultAddr) {
     const fromB = Math.max(0, latest - LPHOLDER_SCAN_BLOCKS);
     const pair = new ethers.Contract(lp, PAIR_TRANSFER_ABI, logsProvider);
     const logs = [];
+    // 熔断:连续 5 个块段失败(端点 URL 错/不支持 getLogs 时每段都秒失败)→ 直接放弃本轮扫描,
+    // 别对着坏端点干磨上千段;同时尊重全局时间预算。
+    let consecFails = 0;
     for (let lo = fromB; lo <= latest; lo += LOG_CHUNK) {
+      if (timeUp()) { console.log(`[LPHolder ${vaultAddr}] 时间预算用尽,扫描提前收尾(已扫到 ${lo})`); break; }
       const hi = Math.min(lo + LOG_CHUNK - 1, latest);
-      try { logs.push(...await pair.queryFilter(pair.filters.Transfer(), lo, hi)); }
-      catch (ce) { console.log(`[LPHolder ${vaultAddr}] 扫块 ${lo}-${hi} 跳过:${ce.shortMessage || ce.message}`); }
+      try {
+        logs.push(...await pair.queryFilter(pair.filters.Transfer(), lo, hi));
+        consecFails = 0;
+      } catch (ce) {
+        // 尽量挖出 RPC 返回的原始错误(ethers 会埋在 info/error 里),400 时里面写着真实原因(如块范围上限)
+        const detail = ce.info?.error?.message || ce.error?.message || (typeof ce.info?.responseBody === "string" ? ce.info.responseBody.slice(0, 200) : "") || "";
+        console.log(`[LPHolder ${vaultAddr}] 扫块 ${lo}-${hi} 跳过:${ce.shortMessage || ce.message}${detail ? ` | ${detail}` : ""}`);
+        if (++consecFails >= 5) {
+          console.log(`[LPHolder ${vaultAddr}] 连续 ${consecFails} 段失败 → 端点大概率不支持 getLogs(检查 LOGS_RPC_URL),放弃本轮自动登记(派发照常)`);
+          break;
+        }
+      }
     }
     const cands = new Set();
     for (const lg of logs) { if (lg.args) { cands.add(lg.args[0]); cands.add(lg.args[1]); } }
