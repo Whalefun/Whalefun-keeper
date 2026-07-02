@@ -53,6 +53,8 @@ jobs:
           # LPHOLDER_SCAN_BLOCKS 设大(如 2000000 ≈ 17 天)→ Actions 手动跑一轮回补老 LP 持有人 → 跑完删除该
           # Variable 恢复默认,避免每轮都全量扫。
           LPHOLDER_SCAN_BLOCKS: ${{ vars.LPHOLDER_SCAN_BLOCKS || '5000' }}
+          # 单次 getLogs 的块范围(须 ≤ 端点允许上限;Alchemy 各套餐不同,用 test-getlogs.mjs 实测后设)。
+          LOG_CHUNK: ${{ vars.LOG_CHUNK || '2000' }}
           # Mainnet LaunchFactoryV2 — comma-separated list. Scans ALL so every factory's vaults keep
           # getting served: v2.2 (0x1230) + two legacy + v2.4 (0xB5AF = USDT + 持有 LP 分红 金库).
           # Override via repo variable ONLY IF you include EVERY address below (a variable replaces this default).
