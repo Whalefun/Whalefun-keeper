@@ -434,7 +434,8 @@ async function processLPHolderVault(vaultAddr) {
       ? await provider.getBalance(vaultAddr)
       : await new ethers.Contract(quote, ["function balanceOf(address) view returns (uint256)"], provider).balanceOf(vaultAddr);
     if (pot < cond) { console.log(`[LPHolder ${vaultAddr}] 池 ${ethers.formatEther(pot)} < 门槛 ${ethers.formatEther(cond)},跳过派发`); return; }
-    const rc = await (await v.processReward(LPHOLDER_REWARD_GAS, { gasLimit: 3000000 })).wait(WAIT_CONFIRMS, WAIT_TIMEOUT_MS);
+    // tx gasLimit 必须罩住合约内的轮询预算(LPHOLDER_REWARD_GAS)+ 固定开销,否则调大预算时 out-of-gas。
+    const rc = await (await v.processReward(LPHOLDER_REWARD_GAS, { gasLimit: LPHOLDER_REWARD_GAS + 1000000n })).wait(WAIT_CONFIRMS, WAIT_TIMEOUT_MS);
     console.log(`[LPHolder ${vaultAddr}] processReward 派发 ✅ tx ${rc.hash}`);
   } catch (e) {
     console.error(`[LPHolder ${vaultAddr}] processReward 失败:`, e.shortMessage || e.message);
