@@ -129,6 +129,9 @@ const LPHOLDER_SCAN_BLOCKS = Number(process.env.LPHOLDER_SCAN_BLOCKS || "5000");
 const LOG_CHUNK = Number(process.env.LOG_CHUNK || "2000"); // 单次 getLogs 区块上限(Alchemy 约 2000;分块扫,兼容各节点范围限制)
 const LPHOLDER_REWARD_GAS = BigInt(process.env.LPHOLDER_REWARD_GAS || "2000000"); // processReward 内部轮询 gas 预算
 const DEAD_ADDR = "0x000000000000000000000000000000000000dead";
+// 自动登记的备用数据源:Etherscan V2 API(免费档即可)。LOGS_RPC_URL 未配时用它拉 LP 最近的
+// Transfer 记录当候选(一次 HTTP/金库/轮,不碰 getLogs → 不受免费节点 archive/限流墙影响)。
+const ETHERSCAN_KEY = process.env.ETHERSCAN_API_KEY || "";
 
 const provider = new ethers.JsonRpcProvider(RPC, undefined, { batchMaxCount: 1 });
 const wallet = new ethers.Wallet(PK, provider);
@@ -360,36 +363,49 @@ async function processLPHolderVault(vaultAddr) {
   try { cond = await v.holderRewardCondition(); } catch { return; } // 非 LPHolder 金库
   try { quote = await v.quoteToken(); } catch { quote = ethers.ZeroAddress; }
 
-  // ① 自动登记新 LP 持有人 —— 仅当配置了专用 getLogs 端点(LOGS_RPC_URL,如 Alchemy)才扫。
-  //    未配置则整段跳过:主 RPC 多不支持/会限流 getLogs,扫描挂主流程会拖垮整轮(曾把 keeper 从 30s 拖到 15min 撞超时)。
-  //    跳过不影响派发;LP 持有人用详情页「登记领分红」(syncLPHolder)自行登记即可。
-  if (logsProvider) try {
+  // ① 自动登记新 LP 持有人 —— 候选来源二选一:
+  //    A. LOGS_RPC_URL(如 Alchemy)→ getLogs 分块扫最近 LPHOLDER_SCAN_BLOCKS 块;
+  //    B. 没配 A 但配了 ETHERSCAN_API_KEY → Etherscan V2 API 拉 LP 最近 200 条 Transfer(一次 HTTP,
+  //       免 getLogs 墙;还能顺带自愈更早的漏网——候选无论多老,后面都有 LP 余额>0 校验兜底)。
+  //    两者都没配才整段跳过(派发不受影响;LP 持有人可用详情页「登记领分红」syncLPHolder 自行登记)。
+  if (logsProvider || ETHERSCAN_KEY) try {
     const lp = await v.lpToken();
-    const latest = await logsProvider.getBlockNumber();
-    const fromB = Math.max(0, latest - LPHOLDER_SCAN_BLOCKS);
-    const pair = new ethers.Contract(lp, PAIR_TRANSFER_ABI, logsProvider);
-    const logs = [];
-    // 熔断:连续 5 个块段失败(端点 URL 错/不支持 getLogs 时每段都秒失败)→ 直接放弃本轮扫描,
-    // 别对着坏端点干磨上千段;同时尊重全局时间预算。
-    let consecFails = 0;
-    for (let lo = fromB; lo <= latest; lo += LOG_CHUNK) {
-      if (timeUp()) { console.log(`[LPHolder ${vaultAddr}] 时间预算用尽,扫描提前收尾(已扫到 ${lo})`); break; }
-      const hi = Math.min(lo + LOG_CHUNK - 1, latest);
-      try {
-        logs.push(...await pair.queryFilter(pair.filters.Transfer(), lo, hi));
-        consecFails = 0;
-      } catch (ce) {
-        // 尽量挖出 RPC 返回的原始错误(ethers 会埋在 info/error 里),400 时里面写着真实原因(如块范围上限)
-        const detail = ce.info?.error?.message || ce.error?.message || (typeof ce.info?.responseBody === "string" ? ce.info.responseBody.slice(0, 200) : "") || "";
-        console.log(`[LPHolder ${vaultAddr}] 扫块 ${lo}-${hi} 跳过:${ce.shortMessage || ce.message}${detail ? ` | ${detail}` : ""}`);
-        if (++consecFails >= 5) {
-          console.log(`[LPHolder ${vaultAddr}] 连续 ${consecFails} 段失败 → 端点大概率不支持 getLogs(检查 LOGS_RPC_URL),放弃本轮自动登记(派发照常)`);
-          break;
+    const cands = new Set();
+    if (logsProvider) {
+      const latest = await logsProvider.getBlockNumber();
+      const fromB = Math.max(0, latest - LPHOLDER_SCAN_BLOCKS);
+      const pair = new ethers.Contract(lp, PAIR_TRANSFER_ABI, logsProvider);
+      const logs = [];
+      // 熔断:连续 5 个块段失败(端点 URL 错/不支持 getLogs 时每段都秒失败)→ 直接放弃本轮扫描,
+      // 别对着坏端点干磨上千段;同时尊重全局时间预算。
+      let consecFails = 0;
+      for (let lo = fromB; lo <= latest; lo += LOG_CHUNK) {
+        if (timeUp()) { console.log(`[LPHolder ${vaultAddr}] 时间预算用尽,扫描提前收尾(已扫到 ${lo})`); break; }
+        const hi = Math.min(lo + LOG_CHUNK - 1, latest);
+        try {
+          logs.push(...await pair.queryFilter(pair.filters.Transfer(), lo, hi));
+          consecFails = 0;
+        } catch (ce) {
+          // 尽量挖出 RPC 返回的原始错误(ethers 会埋在 info/error 里),400 时里面写着真实原因(如块范围上限)
+          const detail = ce.info?.error?.message || ce.error?.message || (typeof ce.info?.responseBody === "string" ? ce.info.responseBody.slice(0, 200) : "") || "";
+          console.log(`[LPHolder ${vaultAddr}] 扫块 ${lo}-${hi} 跳过:${ce.shortMessage || ce.message}${detail ? ` | ${detail}` : ""}`);
+          if (++consecFails >= 5) {
+            console.log(`[LPHolder ${vaultAddr}] 连续 ${consecFails} 段失败 → 端点大概率不支持 getLogs(检查 LOGS_RPC_URL),放弃本轮自动登记(派发照常)`);
+            break;
+          }
         }
       }
+      for (const lg of logs) { if (lg.args) { cands.add(lg.args[0]); cands.add(lg.args[1]); } }
+    } else {
+      // Etherscan V2:LP 代币最近 200 条 Transfer 的 from/to 全进候选(单次调用,免费档 5 req/s 足够)
+      const url = `https://api.etherscan.io/v2/api?chainid=56&module=account&action=tokentx&contractaddress=${lp}&page=1&offset=200&sort=desc&apikey=${ETHERSCAN_KEY}`;
+      const j = await (await fetch(url)).json();
+      if (Array.isArray(j.result)) {
+        for (const t of j.result) { if (t.from) cands.add(t.from); if (t.to) cands.add(t.to); }
+      } else {
+        console.log(`[LPHolder ${vaultAddr}] Etherscan 登记源无数据:${j.message ?? ""} ${typeof j.result === "string" ? j.result.slice(0, 120) : ""}`);
+      }
     }
-    const cands = new Set();
-    for (const lg of logs) { if (lg.args) { cands.add(lg.args[0]); cands.add(lg.args[1]); } }
     const existing = new Set();
     const hn = Number(await v.holderCount());
     for (let i = 0; i < hn; i += 200) { try { (await v.getHolders(i, 200)).forEach((a) => existing.add(a.toLowerCase())); } catch { break; } }

@@ -46,9 +46,12 @@ jobs:
           # ⚠️ 千万别把它设成 Alchemy 之类限速端点 —— 高频调用会被限流,整轮从 30s 飙到 12min+ 甚至撞 15min 超时被杀。
           RPC_URL: ${{ vars.RPC_URL || 'https://bsc-dataseed.bnbchain.org' }}
           # 专用 getLogs 端点(可选,与主 RPC 隔离):只给「持有 LP 分红」金库自动登记扫 LP Transfer 用。
-          # 不设 → 跳过自动登记(LP 持有人用详情页「登记领分红」自行登记,推荐保持不设)。
-          # 要自动登记才设成支持 getLogs 的 Alchemy BSC;含 API key,放 Secret(secrets.LOGS_RPC_URL)别放公开 Variable。
+          # 要用 getLogs 方案才设成支持 getLogs 的 Alchemy BSC;含 API key,放 Secret(secrets.LOGS_RPC_URL)别放公开 Variable。
           LOGS_RPC_URL: ${{ secrets.LOGS_RPC_URL || vars.LOGS_RPC_URL || '' }}
+          # 自动登记备用源(推荐,二选一优先这个):Etherscan V2 API key(免费档够用)。
+          # LOGS_RPC_URL 未设而这个设了 → 每轮对每个 LP 金库调一次 Etherscan 拉最近 200 条 LP Transfer
+          # 当登记候选(免 getLogs 墙,还能自愈更早漏网的持有人)。两个都没设才跳过自动登记。
+          ETHERSCAN_API_KEY: ${{ secrets.ETHERSCAN_API_KEY || '' }}
           # 自动登记的扫块窗口(默认 5000 块≈1小时,增量足够)。首次启用自动登记时:临时把 repo Variable
           # LPHOLDER_SCAN_BLOCKS 设大(如 2000000 ≈ 17 天)→ Actions 手动跑一轮回补老 LP 持有人 → 跑完删除该
           # Variable 恢复默认,避免每轮都全量扫。
