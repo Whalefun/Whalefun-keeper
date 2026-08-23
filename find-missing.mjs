@@ -27,7 +27,22 @@ const EP = [
   ["https://bsc-rpc.publicnode.com", 5000],
   ["https://bsc.drpc.org", 10000],
 ];
-const provs = EP.map(([u, span]) => ({ p: new ethers.JsonRpcProvider(u, undefined, { batchMaxCount: 1 }), span, u }));
+// 每个 RPC 请求都必须有超时。ethers 对"连上了但永不回包"的节点不会自己放弃 ——
+// 踩过:drpc 挂死不返回,而 balOf 轮流打三家,每第三个读取就永久卡住,
+// 开头那 92 个已登记者的余额永远读不完,脚本跑满 600s 一行输出都没有,看着像"扫不到人"。
+const TIMEOUT_MS = Number(process.env.RPC_TIMEOUT_MS || 12000);
+const withTimeout = (pr, label = "") =>
+  Promise.race([pr, new Promise((_, rej) => setTimeout(() => rej(new Error(`RPC 超时 ${TIMEOUT_MS}ms ${label}`)), TIMEOUT_MS))]);
+
+const all = EP.map(([u, span]) => ({ p: new ethers.JsonRpcProvider(u, undefined, { batchMaxCount: 1 }), span, u }));
+// 开跑前先体检,当场踢掉死掉的那家(公共节点时好时坏,今天通不代表明天通)
+const health = await Promise.all(all.map(async (x) => {
+  try { await withTimeout(x.p.getBlockNumber(), x.u); return true; }
+  catch { console.log(`  ⚠️ 节点不可用,本轮跳过:${x.u}`); return false; }
+}));
+const provs = all.filter((_, i) => health[i]);
+if (!provs.length) { console.error("所有 RPC 节点都不可用,退出"); process.exit(1); }
+console.log(`可用节点 ${provs.length}/${all.length}:${provs.map((x) => x.u).join(", ")}\n`);
 const read = provs[0].p;
 
 const vault = new ethers.Contract(VAULT, [
@@ -43,7 +58,7 @@ const f = (x) => ethers.formatEther(x);
 
 // 并发取余额:轮流打三家,避开单家限速
 let rr = 0;
-const balOf = (a) => new ethers.Contract(LP, ["function balanceOf(address) view returns (uint256)"], provs[rr++ % provs.length].p).balanceOf(a);
+const balOf = (a) => withTimeout(new ethers.Contract(LP, ["function balanceOf(address) view returns (uint256)"], provs[rr++ % provs.length].p).balanceOf(a), "balanceOf");
 // 重试到底,不允许静默失败:一次读不到余额如果被当成 0,已登记者的 LP 之和就被低估,
 // 缺口随之虚高(踩过:缺口被算成 136 LP,实际 81.8),扫描还会因为凑不满目标而永不收工。
 async function pool(items, fn, n = 8) {
@@ -101,7 +116,7 @@ async function fetchRange(lo, hi, depth = 0) {
   if (fit.length) {
     for (let attempt = 0; attempt < 3; attempt++) {
       const q = fit[(attempt + rr++) % fit.length].p;
-      try { return await q.getLogs({ address: LP, topics: [T], fromBlock: lo, toBlock: hi }); }
+      try { return await withTimeout(q.getLogs({ address: LP, topics: [T], fromBlock: lo, toBlock: hi }), "getLogs"); }
       catch { await new Promise((r) => setTimeout(r, 300 * (attempt + 1))); }
     }
   }
