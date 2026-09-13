@@ -5,6 +5,7 @@
   "type": "module",
   "description": "Whale.fun dividend keeper — permissionless distributeTo / vault snowball driver (gas-only hot wallet).",
   "dependencies": {
-    "ethers": "^6.13.4"
+    "ethers": "^6.13.4",
+    "tronweb": "^6.5.0"
   }
 }

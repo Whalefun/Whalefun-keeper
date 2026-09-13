@@ -1,0 +1,56 @@
+name: tron-lp-keeper
+
+# Drives the LP-holder dividend vaults on TRON: registers LP holders the vault has not seen, and
+# runs a payout round once a vault's pot is over its threshold. Everything it calls is
+# PERMISSIONLESS — the hot wallet only pays energy and holds no authority over anyone's funds.
+#
+# One-time setup:
+#   1) Generate a FRESH TRON wallet (never the deployer/guardian key). Fund it with TRX for energy.
+#      How much: a round costs roughly 40,000 + 6,600 x holders of energy, and the wallet must be
+#      able to back the transaction's feeLimit, not just the part actually spent. A few hundred TRX
+#      covers a vault with a hundred holders comfortably.
+#   2) Repo Settings -> Secrets and variables -> Actions:
+#        Secret   TRON_KEEPER_PK     that wallet's private key
+#        Secret   TRONGRID_API_KEY   free key from trongrid.io (without it TronGrid allows 3 req/s
+#                                    shared across everyone on this IP, and a run will trip 429)
+#        Variable TRON_NETWORK       "tron" for mainnet, "nile" for testnet (default nile)
+#   3) Run it once from the Actions tab with DRY_RUN to see what it would do.
+#
+# Why 15 minutes is enough on this chain: registration works by reading the LP token's Transfer
+# events, TronGrid allows 5,000 blocks per getLogs call, and TRON produces a block every 3 seconds.
+# One call covers 4 hours, so the default SCAN_BLOCKS of 1500 looks back ~75 minutes every run --
+# far more overlap than the schedule needs, which is why this keeper needs no cursor or resume file.
+
+on:
+  schedule:
+    - cron: "*/15 * * * *" # best-effort; GitHub may delay a run
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "只看不发(1 = 是)"
+        required: false
+        default: "0"
+
+concurrency:
+  group: tron-lp-keeper
+  cancel-in-progress: false # never two rounds at once
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15 # the script keeps its own 10-minute budget and exits cleanly first
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - run: npm install --no-audit --no-fund
+      - name: run keeper
+        env:
+          TRON_KEEPER_PK: ${{ secrets.TRON_KEEPER_PK }}
+          TRONGRID_API_KEY: ${{ secrets.TRONGRID_API_KEY }}
+          TRON_NETWORK: ${{ vars.TRON_NETWORK || 'nile' }}
+          SCAN_BLOCKS: ${{ vars.TRON_SCAN_BLOCKS || '1500' }}
+          BUDGET_S: "600"
+          DRY_RUN: ${{ github.event.inputs.dry_run || '0' }}
+        run: node tron-lp-keeper.mjs
