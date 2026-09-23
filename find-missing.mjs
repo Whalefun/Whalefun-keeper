@@ -37,7 +37,13 @@ const withTimeout = (pr, label = "") =>
 const all = EP.map(([u, span]) => ({ p: new ethers.JsonRpcProvider(u, undefined, { batchMaxCount: 1 }), span, u }));
 // 开跑前先体检,当场踢掉死掉的那家(公共节点时好时坏,今天通不代表明天通)
 const health = await Promise.all(all.map(async (x) => {
-  try { await withTimeout(x.p.getBlockNumber(), x.u); return true; }
+  // 只探 getBlockNumber 不够:2026-09-22 drpc 出块号能通、eth_call 全部报错,balOf 重试轮到它就白烧,
+  // 最后 6 次重试全落空直接崩。所以体检也要打一次 eth_call(读 lpToken())。
+  try {
+    await withTimeout(x.p.getBlockNumber(), x.u);
+    await withTimeout(x.p.call({ to: VAULT, data: ethers.id("lpToken()").slice(0, 10) }), x.u);
+    return true;
+  }
   catch { console.log(`  ⚠️ 节点不可用,本轮跳过:${x.u}`); return false; }
 }));
 const provs = all.filter((_, i) => health[i]);
