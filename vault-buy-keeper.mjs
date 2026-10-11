@@ -14,7 +14,8 @@
 // 运行:  node vault-buy-keeper.mjs          (跑一轮就退出;由 cron-job.org 打 workflow_dispatch 触发)
 // 环境变量:
 //   RPC_URL            BSC RPC,可多个(逗号分隔),按顺序挑第一个"肯收交易"的
-//   KEEPER_PK          热钱包私钥(只放少量 BNB 付 gas)
+//   KEEPER_PK          热钱包私钥(只放少量 BNB 付 gas)。线上和 dividend-keeper 共用同一个钱包,
+//                      靠两个 workflow 在同一个并发组里排队来避免撞 nonce;本地手动跑时别和线上那轮撞车。
 //   LAUNCH_FACTORY_V2  mint 工厂地址,可多个(逗号分隔)—— 新审计版工厂部署后填这里
 //   CURVE_FACTORIES    曲线工厂地址,可多个(逗号分隔)
 //   MIN_PENDING_WEI    待买金额折成 BNB 低于此值不动手(默认 1e15 = 0.001 BNB,约为一次买入 gas 的 50 倍)
@@ -210,6 +211,18 @@ async function main() {
   wallet = PK ? new ethers.Wallet(PK, provider) : null;
   signerOrProvider = wallet || provider;
   console.log(`RPC ${new URL(rpc).host}`);
+  // 这个钱包还有交易没上链 = 另一个任务(分红 keeper,或上一轮没收尾)正在用它 → 这一轮不发,免得两边拿到同一个 nonce。
+  // 线上有并发组兜着,正常走不到这里;公共节点不一定看得到别人的待打包交易,所以这只是多一道保险。
+  if (wallet) {
+    const [mined, queued] = await Promise.all([
+      provider.getTransactionCount(wallet.address, "latest"),
+      provider.getTransactionCount(wallet.address, "pending"),
+    ]);
+    if (queued > mined) {
+      console.log(`热钱包 ${wallet.address} 还有 ${queued - mined} 笔交易在路上,本轮跳过`);
+      return;
+    }
+  }
   const now = BigInt((await provider.getBlock("latest")).timestamp);
   const vaults = await vaultsOf();
   let acted = 0;

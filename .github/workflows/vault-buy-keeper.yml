@@ -8,23 +8,30 @@ name: vault-buy-keeper
 #   请求体 {"ref":"main"},请求头 Authorization: Bearer <细粒度 PAT,仅本仓库 Actions 读写>、
 #   Accept: application/vnd.github+json、Content-Type: application/json;测试运行返回 204 才算对。
 #
-# 一次性设置:
-#   1) 新建一个【独立的】热钱包(不要和 dividend-keeper 共用 KEEPER_PK:两个任务同时发交易会撞 nonce),放少量 BNB。
-#   2) Repo Secrets:VAULT_BUY_KEEPER_PK = 该钱包私钥。
-#   3) 工厂地址已内置(BSC 主网审计版 mint 工厂 0xf21340c8…、曲线工厂 0x27Bdd246…,2026-10-10 部署)。
-#      以后换工厂:改下面的默认值,或设 Repo Variables VAULT_BUY_MINT_FACTORIES / VAULT_BUY_CURVE_FACTORIES(逗号分隔,会整个覆盖默认值)。
+# 热钱包:和 dividend-keeper 用【同一个】(Secret KEEPER_PK,地址 0x79C81a76e8287e5Cf9f362d9E79b08D6112302A3),不用另建。
+# 同一个钱包被两个任务同时用会撞 nonce(两边拿到同一个 nonce,后发的那笔失败),所以这里和 keeper.yml 放在
+# 【同一个并发组】里:同一时刻只有一个任务在发交易,另一个排队。见下面 concurrency 的说明。
+#
+# 工厂地址已内置(BSC 主网审计版 mint 工厂 0xf21340c8…、曲线工厂 0x27Bdd246…,2026-10-10 部署)。
+# 以后换工厂:改下面的默认值,或设 Repo Variables VAULT_BUY_MINT_FACTORIES / VAULT_BUY_CURVE_FACTORIES(逗号分隔,会整个覆盖默认值)。
 
 on:
   workflow_dispatch: {}
 
+# 组名必须和 keeper.yml 的一模一样(GitHub 的并发组是整个仓库共用的,跨 workflow 生效)。
+# cancel-in-progress 必须是 false:设成 true 的话,这个 2 分钟一次的任务会把正在跑的分红 keeper 拦腰砍掉
+# (交易发到一半)。排队规则:组里同时最多一个在跑、一个在等;新来的会顶掉【在等的】那个,不会动在跑的。
+#   · 分红 keeper 在跑(通常 30 秒,最坏 12 分钟)→ 本任务排队,跑完马上接上;期间多次触发只留最新一个。
+#   · 本任务在跑(约半分钟)时分红 keeper 被触发 → 它排队,本任务结束就跑。
+# 卡死自愈靠超时:本任务 3 分钟、分红 keeper 15 分钟,到点自动结束放行下一个。
 concurrency:
-  group: vault-buy-keeper
-  cancel-in-progress: true     # 上一轮卡住就让新一轮顶掉它:每轮都是幂等的空操作或一笔有界买入,队列不会堵死
+  group: dividend-keeper
+  cancel-in-progress: false
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 4
+    timeout-minutes: 3
     steps:
       - uses: actions/checkout@v4
 
@@ -38,7 +45,7 @@ jobs:
 
       - name: Run vault buy keeper (one round)
         env:
-          KEEPER_PK: ${{ secrets.VAULT_BUY_KEEPER_PK }}
+          KEEPER_PK: ${{ secrets.KEEPER_PK }}
           # 可多个(逗号分隔);脚本开跑前逐个探测"肯不肯收交易",挑第一个能用的。不设则用脚本内置的候选列表。
           RPC_URL: ${{ vars.VAULT_BUY_RPC_URL }}
           LAUNCH_FACTORY_V2: ${{ vars.VAULT_BUY_MINT_FACTORIES || '0xf21340c8B8227D2Fc20e385dB9D058F8ce13eE7b' }}
@@ -46,7 +53,7 @@ jobs:
           MIN_PENDING_WEI: ${{ vars.VAULT_BUY_MIN_PENDING_WEI }}
         run: |
           if [ -z "$KEEPER_PK" ]; then
-            echo "::warning::VAULT_BUY_KEEPER_PK secret not set — skipping."
+            echo "::warning::KEEPER_PK secret not set — skipping."
             exit 0
           fi
           if [ -z "$LAUNCH_FACTORY_V2$CURVE_FACTORIES" ]; then

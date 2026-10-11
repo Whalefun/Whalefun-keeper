@@ -44,7 +44,7 @@ node dividend-keeper.mjs
 这两种金库收税时不再当场兑换(审计版代币打款只带 10 万 gas),买入改为外部触发,且合约自己限速:每 60 秒最多一笔、每笔 ≤ 池深 0.25%、池子本秒有成交或现价偏离其均价超过 1% 时不买。所以它需要 1~2 分钟一轮,而不是 15 分钟。漏跑只是延迟,钱一直在金库里。
 
 设置:
-1. **另建一个热钱包**(不要复用 `KEEPER_PK`:两个任务同时发交易会撞 nonce),Secret 名 `VAULT_BUY_KEEPER_PK`。
+1. 热钱包和分红 keeper 共用(Secret `KEEPER_PK`,地址 `0x79C81a76e8287e5Cf9f362d9E79b08D6112302A3`),不用另建。两个 workflow 放在同一个并发组 `dividend-keeper` 里,同一时刻只有一个在发交易,不会撞 nonce —— 所以两边的组名要保持一致、`cancel-in-progress` 都必须是 false。
 2. 工厂地址已内置在 workflow 里(BSC 主网审计版 mint 工厂 `0xf21340c8…`、曲线工厂 `0x27Bdd246…`)。换工厂时改默认值,或设 Variables `VAULT_BUY_MINT_FACTORIES` / `VAULT_BUY_CURVE_FACTORIES`(逗号分隔,会整个覆盖默认值)。
 3. 触发:workflow 只有 `workflow_dispatch`,由 cron-job.org 每 2 分钟 POST 一次 dispatch 接口(做法见 yml 头部注释)。
 4. 可选:`VAULT_BUY_RPC_URL`(逗号分隔的候选;脚本开跑前逐个探测"肯不肯收交易")、`VAULT_BUY_MIN_PENDING_WEI`(待买金额折成 BNB 的门槛,默认 0.001)。

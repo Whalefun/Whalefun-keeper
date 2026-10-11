@@ -19,6 +19,8 @@ on:
     - cron: "*/15 * * * *"   # every ~15 min (GitHub schedules are best-effort / may be delayed)
   workflow_dispatch: {}        # allow manual runs from the Actions tab
 
+# vault-buy-keeper.yml 用的是【同一个热钱包、同一个并发组名】—— 两个任务不会同时发交易(否则撞 nonce)。
+# 改这个组名的话两边要一起改;cancel-in-progress 两边都必须保持 false。
 concurrency:
   group: dividend-keeper
   cancel-in-progress: false    # never run two keeper rounds at once (avoids nonce clashes)
