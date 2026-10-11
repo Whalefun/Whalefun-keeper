@@ -35,13 +35,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # 和 keeper.yml 一样:不开 npm 缓存、用 npm install。这个仓库的 package-lock.json 在 .gitignore 里,
+      # GitHub 上没有锁文件 —— setup-node 的 cache: npm 和 npm ci 都要求有锁文件,没有就直接失败。
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
-          cache: npm
 
       - name: Install deps
-        run: npm ci --no-audit --no-fund
+        run: npm install --no-audit --no-fund
 
       - name: Run vault buy keeper (one round)
         env:
