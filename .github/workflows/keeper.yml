@@ -59,9 +59,10 @@ jobs:
           # 单次 getLogs 的块范围(须 ≤ 端点允许上限;Alchemy 各套餐不同,用 test-getlogs.mjs 实测后设)。
           LOG_CHUNK: ${{ vars.LOG_CHUNK || '2000' }}
           # Mainnet LaunchFactoryV2 — comma-separated list. Scans ALL so every factory's vaults keep
-          # getting served: v2.2 (0x1230) + two legacy + v2.4 (0xB5AF = USDT + 持有 LP 分红 金库).
+          # getting served: v2.2 (0x1230) + two legacy + v2.4 (0xB5AF = USDT + 持有 LP 分红 金库)
+          # + the audited factory (0xf213, 2026-10-10: every new launch goes there).
           # Override via repo variable ONLY IF you include EVERY address below (a variable replaces this default).
-          LAUNCH_FACTORY_V2: ${{ vars.LAUNCH_FACTORY_V2 || '0x1230B67525247DA20e56E9f8CAaA263ae670401a,0xaDeb3eaEbA2fE20Afdb20529382e4395FaA2821c,0x2196D9B1Ee3411a4C6E26a417861713151EcdC07,0xB5AF6387ed653F3f15C01Da4031571Fd454DF22f' }}
+          LAUNCH_FACTORY_V2: ${{ vars.LAUNCH_FACTORY_V2 || '0x1230B67525247DA20e56E9f8CAaA263ae670401a,0xaDeb3eaEbA2fE20Afdb20529382e4395FaA2821c,0x2196D9B1Ee3411a4C6E26a417861713151EcdC07,0xB5AF6387ed653F3f15C01Da4031571Fd454DF22f,0xf21340c8B8227D2Fc20e385dB9D058F8ce13eE7b' }}
           # Dead-token filter: skip launches whose pool WBNB < this many BNB (default 2). Set repo var to tune.
           MIN_POOL_BNB: ${{ vars.MIN_POOL_BNB || '2' }}
           # Manual skip list: comma-separated token addresses to always ignore. Set repo var SKIP_TOKENS.

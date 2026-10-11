@@ -1,0 +1,56 @@
+name: vault-buy-keeper
+
+# 替"延后买入"的金库(储备托底 / LP 质押分红的新实现)触发买入。每轮几秒到一分钟。
+# 调用的全是 permissionless 函数(buyPendingReserve / sync),热钱包只付 gas、没有任何权限。
+#
+# 触发方式:只有 workflow_dispatch —— 由 cron-job.org 每 2 分钟打一次 dispatch 接口,不用 GitHub 自带定时器。
+#   POST https://api.github.com/repos/<owner>/<repo>/actions/workflows/vault-buy-keeper.yml/dispatches
+#   请求体 {"ref":"main"},请求头 Authorization: Bearer <细粒度 PAT,仅本仓库 Actions 读写>、
+#   Accept: application/vnd.github+json、Content-Type: application/json;测试运行返回 204 才算对。
+#
+# 一次性设置:
+#   1) 新建一个【独立的】热钱包(不要和 dividend-keeper 共用 KEEPER_PK:两个任务同时发交易会撞 nonce),放少量 BNB。
+#   2) Repo Secrets:VAULT_BUY_KEEPER_PK = 该钱包私钥。
+#   3) 工厂地址已内置(BSC 主网审计版 mint 工厂 0xf21340c8…、曲线工厂 0x27Bdd246…,2026-10-10 部署)。
+#      以后换工厂:改下面的默认值,或设 Repo Variables VAULT_BUY_MINT_FACTORIES / VAULT_BUY_CURVE_FACTORIES(逗号分隔,会整个覆盖默认值)。
+
+on:
+  workflow_dispatch: {}
+
+concurrency:
+  group: vault-buy-keeper
+  cancel-in-progress: true     # 上一轮卡住就让新一轮顶掉它:每轮都是幂等的空操作或一笔有界买入,队列不会堵死
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - name: Install deps
+        run: npm ci --no-audit --no-fund
+
+      - name: Run vault buy keeper (one round)
+        env:
+          KEEPER_PK: ${{ secrets.VAULT_BUY_KEEPER_PK }}
+          # 可多个(逗号分隔);脚本开跑前逐个探测"肯不肯收交易",挑第一个能用的。不设则用脚本内置的候选列表。
+          RPC_URL: ${{ vars.VAULT_BUY_RPC_URL }}
+          LAUNCH_FACTORY_V2: ${{ vars.VAULT_BUY_MINT_FACTORIES || '0xf21340c8B8227D2Fc20e385dB9D058F8ce13eE7b' }}
+          CURVE_FACTORIES: ${{ vars.VAULT_BUY_CURVE_FACTORIES || '0x27Bdd246E1dbbA83C6b926BB261F2478f3CDa564' }}
+          MIN_PENDING_WEI: ${{ vars.VAULT_BUY_MIN_PENDING_WEI }}
+        run: |
+          if [ -z "$KEEPER_PK" ]; then
+            echo "::warning::VAULT_BUY_KEEPER_PK secret not set — skipping."
+            exit 0
+          fi
+          if [ -z "$LAUNCH_FACTORY_V2$CURVE_FACTORIES" ]; then
+            echo "::warning::no factories configured (VAULT_BUY_MINT_FACTORIES / VAULT_BUY_CURVE_FACTORIES) — skipping."
+            exit 0
+          fi
+          node vault-buy-keeper.mjs
