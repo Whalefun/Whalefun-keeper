@@ -3,7 +3,7 @@ name: vault-buy-keeper
 # 替"延后买入"的金库(储备托底 / LP 质押分红的新实现)触发买入。每轮几秒到一分钟。
 # 调用的全是 permissionless 函数(buyPendingReserve / sync),热钱包只付 gas、没有任何权限。
 #
-# 触发方式:只有 workflow_dispatch —— 由 cron-job.org 每 2 分钟打一次 dispatch 接口,不用 GitHub 自带定时器。
+# 触发方式:只有 workflow_dispatch —— 由 cron-job.org 每 5 分钟打一次 dispatch 接口,不用 GitHub 自带定时器。
 #   POST https://api.github.com/repos/<owner>/<repo>/actions/workflows/vault-buy-keeper.yml/dispatches
 #   请求体 {"ref":"main"},请求头 Authorization: Bearer <细粒度 PAT,仅本仓库 Actions 读写>、
 #   Accept: application/vnd.github+json、Content-Type: application/json;测试运行返回 204 才算对。
@@ -19,7 +19,7 @@ on:
   workflow_dispatch: {}
 
 # 组名必须和 keeper.yml 的一模一样(GitHub 的并发组是整个仓库共用的,跨 workflow 生效)。
-# cancel-in-progress 必须是 false:设成 true 的话,这个 2 分钟一次的任务会把正在跑的分红 keeper 拦腰砍掉
+# cancel-in-progress 必须是 false:设成 true 的话,这个 5 分钟一次的任务会把正在跑的分红 keeper 拦腰砍掉
 # (交易发到一半)。排队规则:组里同时最多一个在跑、一个在等;新来的会顶掉【在等的】那个,不会动在跑的。
 #   · 分红 keeper 在跑(通常 30 秒,最坏 12 分钟)→ 本任务排队,跑完马上接上;期间多次触发只留最新一个。
 #   · 本任务在跑(约半分钟)时分红 keeper 被触发 → 它排队,本任务结束就跑。
