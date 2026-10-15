@@ -13,6 +13,8 @@
 // 漏跑只是延迟,钱一直在金库里;"这一轮不让买"在链上是便宜的空操作。
 // 只认新实现的金库(探针:lastBuyLookAt())。老实现的金库由 dividend-keeper.mjs 照旧处理。
 //
+// 顺带(2026-10-15 加):燃烧池金库(BurnPoolVault)的到点 poke —— 见 tryBurnPool 上面的说明。
+//
 // 运行:  node vault-buy-keeper.mjs          (跑一轮就退出;由 cron-job.org 打 workflow_dispatch 触发)
 // 环境变量:
 //   RPC_URL            BSC RPC,可多个(逗号分隔),按顺序挑第一个"肯收交易"的
@@ -20,6 +22,7 @@
 //                      靠两个 workflow 在同一个并发组里排队来避免撞 nonce;本地手动跑时别和线上那轮撞车。
 //   LAUNCH_FACTORY_V2  mint 工厂地址,可多个(逗号分隔)—— 新审计版工厂部署后填这里
 //   CURVE_FACTORIES    曲线工厂地址,可多个(逗号分隔)
+//   BURN_POOL_FACTORIES 燃烧池金库工厂地址,可多个(逗号分隔)—— 脚本自己从工厂绑定的 mint 工厂里找出它建的金库
 //   MIN_PENDING_WEI    待买金额折成 BNB 低于此值不动手(默认 1e15 = 0.001 BNB,约为一次买入 gas 的 50 倍)
 //   DRY_RUN=1          只打印会做什么,不发交易
 
@@ -32,15 +35,20 @@ const PK = (() => { const k = (process.env.KEEPER_PK || "").trim(); return k ? (
 const list = (v) => (v || "").split(/[\s,;]+/).map((s) => s.trim()).filter(Boolean);
 const MINT_FACTORIES = list(process.env.LAUNCH_FACTORY_V2);
 const CURVE_FACTORIES = list(process.env.CURVE_FACTORIES);
+const BURN_POOL_FACTORIES = list(process.env.BURN_POOL_FACTORIES);
 const MIN_PENDING = BigInt(process.env.MIN_PENDING_WEI || "1000000000000000");
 const WBNB = process.env.WBNB || "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c";
 const DEX_FACTORY = process.env.DEX_FACTORY || "0xcA143Ce32Fe78f1f9019d7d551a6402fC5350c73"; // PancakeSwap V2
 const DRY = process.env.DRY_RUN === "1";
 const BUY_INTERVAL = 60n; // BoundedBuyV1.BUY_INTERVAL
 const GAS_LIMIT = 900000n; // 实测一次有界买入 30~36 万 gas(两跳路径更高);给足余量,用不完自动退
+const TRIGGER_SERVICE = "0xcf4EE25035CF883895110f367F5BA8172416a7F9"; // FlapTriggerService(燃烧池金库自己预约回调用的)
+const MULTICALL3 = "0xcA11bde05977b3631167028862bE2a173976CA11";
+const STALE_GRACE = 1800n; // BurnPoolVault.STALE_GRACE:预约时间过了这么久还没回调,合约自己也当它作废、允许重新预约
+const POKE_GAS_LIMIT = 1500000n; // 实测空 poke 约 18 万 gas、帮烧一轮 + 重新预约约 41 万;再叠上拉盘买币也远低于此,用不完自动退
 
-if ((!PK && !DRY) || MINT_FACTORIES.length + CURVE_FACTORIES.length === 0) {
-  console.error("缺少 KEEPER_PK,或 LAUNCH_FACTORY_V2 / CURVE_FACTORIES 都没填");
+if ((!PK && !DRY) || MINT_FACTORIES.length + CURVE_FACTORIES.length + BURN_POOL_FACTORIES.length === 0) {
+  console.error("缺少 KEEPER_PK,或 LAUNCH_FACTORY_V2 / CURVE_FACTORIES / BURN_POOL_FACTORIES 都没填");
   process.exit(1);
 }
 
@@ -96,6 +104,23 @@ const PAIR_ABI = [
   "function token0() view returns (address)",
   "function getReserves() view returns (uint112,uint112,uint32)",
 ];
+const BURN_POOL_FACTORY_ABI = [
+  "function implementation() view returns (address)",
+  "function vaultPortal() view returns (address)",
+];
+const BURN_POOL_ABI = [
+  "function lastBurner() view returns (address)",
+  "function nextRoundAt() view returns (uint256)",
+  "function scheduled() view returns (bool)",
+  "function scheduledFor() view returns (uint64)",
+  "function roundCount() view returns (uint256)",
+  "function pendingRequestId() view returns (uint256)",
+  "function poke()",
+];
+const TRIGGER_ABI = ["function getFee() view returns (uint256)"];
+const MULTICALL3_ABI = [
+  "function aggregate3((address target,bool allowFailure,bytes callData)[] calls) payable returns ((bool success,bytes returnData)[] returnData)",
+];
 
 // 报价币数量折成 BNB(只用来决定"值不值得发这笔交易",不参与任何链上定价)。
 // 报价币精度和单价差得很远(USDT 18 位、DOGE 8 位、BTCB 一枚几万美元),按原始数量设门槛必然有的永远不触发、有的白烧 gas。
@@ -144,6 +169,29 @@ async function vaultsOf() {
       for (const r of tvs) if (r.status === "fulfilled" && r.value !== ethers.ZeroAddress) out.add(r.value);
       console.log(`曲线工厂 ${f}: ${n} 个币`);
     } catch (e) { console.error(`曲线工厂 ${f} 读取失败:`, e.shortMessage || e.message); }
+  }
+  return [...out];
+}
+
+// 燃烧池工厂没有列出金库的接口(只发 VaultCreated 事件,公共节点的 getLogs 又基本被封),所以反过来找:
+// 工厂只接受它绑定的 mint 工厂(vaultPortal)调用,建出来的金库就是那边某个币的 taxVault,而且是工厂 implementation 的
+// 最小代理克隆(EIP-1167)—— 逐个币比对 taxVault 的字节码,新发的燃烧池币不用改配置就会被找到。
+async function burnPoolVaults() {
+  const out = new Set();
+  for (const f of BURN_POOL_FACTORIES) {
+    try {
+      const c = new ethers.Contract(f, BURN_POOL_FACTORY_ABI, provider);
+      const [impl, portal] = await Promise.all([c.implementation(), c.vaultPortal()]);
+      const lf = new ethers.Contract(portal, MINT_FACTORY_ABI, provider);
+      const n = Number(await lf.launchCount());
+      const infos = await Promise.allSettled(Array.from({ length: n }, (_, i) => lf.launches(i)));
+      const tvs = infos.filter((r) => r.status === "fulfilled" && r.value.taxVault !== ethers.ZeroAddress).map((r) => r.value.taxVault);
+      const codes = await Promise.allSettled(tvs.map((a) => provider.getCode(a)));
+      const clone = `0x363d3d373d3d3d363d73${impl.slice(2)}5af43d82803e903d91602b57fd5bf3`.toLowerCase();
+      let found = 0;
+      codes.forEach((r, i) => { if (r.status === "fulfilled" && r.value.toLowerCase() === clone) { out.add(tvs[i]); found++; } });
+      console.log(`燃烧池工厂 ${f}: 绑定 mint 工厂 ${portal}(${n} 个币),其中燃烧池金库 ${found} 个`);
+    } catch (e) { console.error(`燃烧池工厂 ${f} 读取失败:`, e.shortMessage || e.message); }
   }
   return [...out];
 }
@@ -207,6 +255,56 @@ async function tryLps(vault) {
   return true;
 }
 
+const fmtTime = (ts) => new Date((Number(ts) + 8 * 3600) * 1000).toISOString().slice(5, 16).replace("T", " ") + "(UTC+8)";
+const fmtLeft = (s) => `${s / 3600n} 小时 ${(s % 3600n) / 60n} 分`;
+
+// 燃烧池金库(BurnPoolVault):"12 小时无人燃烧 → 储备池替最后燃烧人烧 100U"是懒执行的,只在 poke / 存币 / 定时回调里跑。
+// 金库靠 FlapTriggerService 预约回调,可金库 BNB 付不起预约费时定时器就停了,到点的轮次要等下一个人交互才执行
+// (2026-10-15 鲸鱼人生有人投诉"到点没帮烧")。所以这里替它调 permissionless 的 poke(),热钱包只付 gas。满足任一条件才考虑:
+//   (a) 有最后燃烧人,且已到点
+//   (b) 定时器没在预约(或预约已过期),且金库余额够付预约费 —— poke 会顺带重新预约
+// 发之前先模拟:经 Multicall3 在同一个 eth_call 里先 poke() 再读 roundCount / scheduled / pendingRequestId,
+// 只有"会帮烧"或"会预约上"才发 —— 储备不足一轮或余额扣掉 LP 那半税后不够预约费时 poke 是空操作,不白烧 gas。
+async function tryBurnPool(vault, now, fee) {
+  const v = new ethers.Contract(vault, BURN_POOL_ABI, signerOrProvider);
+  let burner, dueAt, sched, schedFor, rounds, reqId, bal;
+  try {
+    [burner, dueAt, sched, schedFor, rounds, reqId, bal] = await Promise.all([
+      v.lastBurner(), v.nextRoundAt(), v.scheduled(), v.scheduledFor(), v.roundCount(), v.pendingRequestId(), provider.getBalance(vault),
+    ]);
+  } catch (e) { console.error(`燃烧池金库 ${vault} 读取失败:`, e.shortMessage || e.message); return false; }
+  const hasBurner = burner !== ethers.ZeroAddress;
+  const due = hasBurner && now >= dueAt;
+  const armed = sched && now <= schedFor + STALE_GRACE;
+  const canArm = !armed && fee !== null && bal >= fee;
+  console.log(
+    `燃烧池金库 ${vault}: 帮烧到点 ${hasBurner ? fmtTime(dueAt) + (due ? "(已到点)" : `(还差 ${fmtLeft(dueAt - now)})`) : "—(还没有最后燃烧人)"}` +
+      ` · 定时器 ${armed ? "已预约 " + fmtTime(schedFor) : sched ? "预约已过期" : "未预约"}` +
+      ` · 余额 ${ethers.formatEther(bal)} BNB / 预约费 ${fee === null ? "读不到" : ethers.formatEther(fee)}`
+  );
+  if (!due && !canArm) { console.log("  → 本轮不 poke"); return false; }
+
+  const mc = new ethers.Interface(MULTICALL3_ABI);
+  const reads = ["roundCount", "scheduled", "pendingRequestId"];
+  const calls = ["poke", ...reads].map((f) => ({ target: vault, allowFailure: true, callData: v.interface.encodeFunctionData(f) }));
+  let roundsAfter, schedAfter, reqIdAfter;
+  try {
+    const raw = await provider.call({ to: MULTICALL3, from: wallet?.address, data: mc.encodeFunctionData("aggregate3", [calls]) });
+    const [res] = mc.decodeFunctionResult("aggregate3", raw);
+    if (!res[0].success) { console.log(`  → 模拟 poke() 会回滚(${res[0].returnData}),本轮不发`); return false; }
+    [roundsAfter, schedAfter, reqIdAfter] = reads.map((f, i) => v.interface.decodeFunctionResult(f, res[i + 1].returnData)[0]);
+  } catch (e) { console.error("  → 模拟失败,本轮不发:", e.shortMessage || e.message); return false; }
+  const willBurn = roundsAfter > rounds;
+  const willArm = schedAfter && reqIdAfter !== reqId;
+  if (!willBurn && !willArm) {
+    console.log("  → 模拟显示这次 poke 既不会帮烧、也预约不上定时器(储备不足一轮,或余额不够预约费),本轮不发");
+    return false;
+  }
+  const what = [willBurn && `帮烧第 ${roundsAfter} 轮`, willArm && "重新预约定时器"].filter(Boolean).join(" + ");
+  await send(`燃烧池金库 poke(${what})`, vault, (o) => v.poke({ ...o, gasLimit: POKE_GAS_LIMIT }));
+  return true;
+}
+
 async function main() {
   const rpc = await pickRpc();
   provider = new ethers.JsonRpcProvider(rpc, undefined, { batchMaxCount: 1, cacheTimeout: -1 });
@@ -235,7 +333,18 @@ async function main() {
     if (await tryFloor(vault)) { acted++; continue; }
     if (await tryLps(vault)) acted++;
   }
-  console.log(`本轮完成:${vaults.length} 个金库,其中 ${acted} 个是有界买入的新实现${wallet ? " · keeper " + wallet.address : ""}`);
+  const pools = await burnPoolVaults();
+  let poked = 0;
+  if (pools.length) {
+    let fee = null; // 读不到预约费就只按"到点"判断
+    try { fee = await new ethers.Contract(TRIGGER_SERVICE, TRIGGER_ABI, provider).getFee(); } catch (e) { console.error("读预约费失败:", e.shortMessage || e.message); }
+    const t = BigInt((await provider.getBlock("latest")).timestamp); // 上面可能已发过交易、等过确认,重新取时间
+    for (const vault of pools) if (await tryBurnPool(vault, t, fee)) poked++;
+  }
+  console.log(
+    `本轮完成:${vaults.length} 个金库,其中 ${acted} 个是有界买入的新实现 · 燃烧池金库 ${pools.length} 个,poke ${poked} 个` +
+      (wallet ? " · keeper " + wallet.address : "")
+  );
   if (failed) { console.error(`${failed} 笔交易失败`); process.exit(1); } // 让这次运行在 Actions 里显示为红的
 }
 

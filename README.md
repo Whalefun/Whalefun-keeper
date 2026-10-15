@@ -43,15 +43,17 @@ node dividend-keeper.mjs
 
 这两种金库收税时不再当场兑换(审计版代币打款只带 10 万 gas),买入改为外部触发,且合约自己限速:每 60 秒最多一笔、每笔 ≤ 池深 0.25%、池子本秒有成交或现价偏离其均价超过 1% 时不买。所以它单独跑,线上每 5 分钟一轮(可在 1 分钟到 1 小时之间调:越短换得越快,超过 1 小时合约只刷新读数、不会买)。漏跑只是延迟,钱一直在金库里。
 
+顺带(2026-10-15 起):**燃烧池金库到点 poke**。燃烧池金库"12 小时无人燃烧→储备池替最后燃烧人烧 100U"是懒执行的,金库 BNB 付不起 FlapTriggerService 预约费(0.0002)时定时器停摆,到点的轮次要等下一个人交互才执行。脚本对每个燃烧池金库:有最后燃烧人且已到点,或定时器没在预约(或已过期)且余额够预约费 → 经 Multicall3 模拟 `poke()`,模拟显示会帮烧或会预约上才发(每轮每个金库最多一笔,空 poke 不发)。金库从燃烧池工厂绑定的 mint 工厂里自动找(taxVault 是工厂实现的 EIP-1167 克隆)。
+
 设置:
 1. 热钱包和分红 keeper 共用(Secret `KEEPER_PK`,地址 `0x79C81a76e8287e5Cf9f362d9E79b08D6112302A3`),不用另建。两个 workflow 放在同一个并发组 `dividend-keeper` 里,同一时刻只有一个在发交易,不会撞 nonce —— 所以两边的组名要保持一致、`cancel-in-progress` 都必须是 false。
-2. 工厂地址已内置在 workflow 里(BSC 主网审计版 mint 工厂 `0xf21340c8…`、曲线工厂 `0x27Bdd246…`)。换工厂时改默认值,或设 Variables `VAULT_BUY_MINT_FACTORIES` / `VAULT_BUY_CURVE_FACTORIES`(逗号分隔,会整个覆盖默认值)。
+2. 工厂地址已内置在 workflow 里(BSC 主网审计版 mint 工厂 `0xf21340c8…`、曲线工厂 `0x27Bdd246…`;燃烧池工厂 `0x6F2C9bc9…`(老)、`0x9BFDfbB9…`(审计版))。换工厂时改默认值,或设 Variables `VAULT_BUY_MINT_FACTORIES` / `VAULT_BUY_CURVE_FACTORIES` / `VAULT_BUY_BURN_POOL_FACTORIES`(逗号分隔,会整个覆盖默认值)。
 3. 触发:workflow 只有 `workflow_dispatch`,由 cron-job.org 每 5 分钟 POST 一次 dispatch 接口(做法见 yml 头部注释)。
 4. 可选:`VAULT_BUY_RPC_URL`(逗号分隔的候选;脚本开跑前逐个探测"肯不肯收交易")、`VAULT_BUY_MIN_PENDING_WEI`(待买金额折成 BNB 的门槛,默认 0.001)。
 
 本地空跑(不发交易):
 ```bash
-DRY_RUN=1 LAUNCH_FACTORY_V2=0x... CURVE_FACTORIES=0x... node vault-buy-keeper.mjs
+DRY_RUN=1 LAUNCH_FACTORY_V2=0x... CURVE_FACTORIES=0x... BURN_POOL_FACTORIES=0x... node vault-buy-keeper.mjs
 ```
 
 有交易失败时脚本以非零退出,这次运行在 Actions 里显示为红色。

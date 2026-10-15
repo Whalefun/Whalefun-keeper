@@ -1,7 +1,8 @@
 name: vault-buy-keeper
 
-# 替"延后买入"的金库(储备托底 / LP 质押分红的新实现)触发买入。每轮几秒到一分钟。
-# 调用的全是 permissionless 函数(buyPendingReserve / sync),热钱包只付 gas、没有任何权限。
+# 替"延后买入"的金库(储备托底 / LP 质押分红的新实现)触发买入;顺带给燃烧池金库到点 poke(到点帮烧 / 定时器停摆时
+# 重新预约,先模拟、确实有用才发)。每轮几秒到一分钟。
+# 调用的全是 permissionless 函数(buyPendingReserve / sync / poke),热钱包只付 gas、没有任何权限。
 #
 # 触发方式:只有 workflow_dispatch —— 由 cron-job.org 每 5 分钟打一次 dispatch 接口,不用 GitHub 自带定时器。
 #   POST https://api.github.com/repos/<owner>/<repo>/actions/workflows/vault-buy-keeper.yml/dispatches
@@ -13,7 +14,10 @@ name: vault-buy-keeper
 # 【同一个并发组】里:同一时刻只有一个任务在发交易,另一个排队。见下面 concurrency 的说明。
 #
 # 工厂地址已内置(BSC 主网审计版 mint 工厂 0xf21340c8…、曲线工厂 0x27Bdd246…,2026-10-10 部署)。
-# 以后换工厂:改下面的默认值,或设 Repo Variables VAULT_BUY_MINT_FACTORIES / VAULT_BUY_CURVE_FACTORIES(逗号分隔,会整个覆盖默认值)。
+# 燃烧池金库工厂:老工厂 0x6F2C9bc9…(绑旧 mint 工厂 0xB5AF…)、审计版 0x9BFDfbB9…(绑 0xf21340c8…),脚本从工厂绑定的
+# mint 工厂里自己找出燃烧池金库,新发的币不用改配置。
+# 以后换工厂:改下面的默认值,或设 Repo Variables VAULT_BUY_MINT_FACTORIES / VAULT_BUY_CURVE_FACTORIES /
+# VAULT_BUY_BURN_POOL_FACTORIES(逗号分隔,会整个覆盖默认值)。
 
 on:
   workflow_dispatch: {}
@@ -51,14 +55,15 @@ jobs:
           RPC_URL: ${{ vars.VAULT_BUY_RPC_URL }}
           LAUNCH_FACTORY_V2: ${{ vars.VAULT_BUY_MINT_FACTORIES || '0xf21340c8B8227D2Fc20e385dB9D058F8ce13eE7b' }}
           CURVE_FACTORIES: ${{ vars.VAULT_BUY_CURVE_FACTORIES || '0x27Bdd246E1dbbA83C6b926BB261F2478f3CDa564' }}
+          BURN_POOL_FACTORIES: ${{ vars.VAULT_BUY_BURN_POOL_FACTORIES || '0x6F2C9bc9f8D802bA642efD9406Cc9A5636A07742,0x9BFDfbB942CcC1492B97b81DE6ABaFd9E6373D48' }}
           MIN_PENDING_WEI: ${{ vars.VAULT_BUY_MIN_PENDING_WEI }}
         run: |
           if [ -z "$KEEPER_PK" ]; then
             echo "::warning::KEEPER_PK secret not set — skipping."
             exit 0
           fi
-          if [ -z "$LAUNCH_FACTORY_V2$CURVE_FACTORIES" ]; then
-            echo "::warning::no factories configured (VAULT_BUY_MINT_FACTORIES / VAULT_BUY_CURVE_FACTORIES) — skipping."
+          if [ -z "$LAUNCH_FACTORY_V2$CURVE_FACTORIES$BURN_POOL_FACTORIES" ]; then
+            echo "::warning::no factories configured (VAULT_BUY_MINT_FACTORIES / VAULT_BUY_CURVE_FACTORIES / VAULT_BUY_BURN_POOL_FACTORIES) — skipping."
             exit 0
           fi
           node vault-buy-keeper.mjs
