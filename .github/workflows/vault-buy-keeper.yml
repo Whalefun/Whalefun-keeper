@@ -1,7 +1,7 @@
 name: vault-buy-keeper
 
-# 替"延后买入"的金库(储备托底 / LP 质押分红的新实现)触发买入;顺带给燃烧池金库到点 poke(到点帮烧 / 定时器停摆时
-# 重新预约,先模拟、确实有用才发)。每轮几秒到一分钟。
+# 替"延后买入"的金库(储备托底 / LP 质押分红的新实现)触发买入;顺带给燃烧池金库 poke(到点帮烧 / 定时器停摆时
+# 重新预约 / 金库价落后现价 ≥1% 且满 10 分钟时刷新,先模拟、确实有用才发)。每轮几秒到一分钟。
 # 调用的全是 permissionless 函数(buyPendingReserve / sync / poke),热钱包只付 gas、没有任何权限。
 #
 # 触发方式:只有 workflow_dispatch —— 由 cron-job.org 每 5 分钟打一次 dispatch 接口,不用 GitHub 自带定时器。
@@ -57,6 +57,8 @@ jobs:
           CURVE_FACTORIES: ${{ vars.VAULT_BUY_CURVE_FACTORIES || '0x27Bdd246E1dbbA83C6b926BB261F2478f3CDa564' }}
           BURN_POOL_FACTORIES: ${{ vars.VAULT_BUY_BURN_POOL_FACTORIES || '0x6F2C9bc9f8D802bA642efD9406Cc9A5636A07742,0x9BFDfbB942CcC1492B97b81DE6ABaFd9E6373D48' }}
           MIN_PENDING_WEI: ${{ vars.VAULT_BUY_MIN_PENDING_WEI }}
+          # 燃烧池金库价和现价差到多少(基点)才刷新,不设 = 100(1%)
+          BURN_POOL_PRICE_LAG_BPS: ${{ vars.VAULT_BUY_BURN_POOL_PRICE_LAG_BPS }}
         run: |
           if [ -z "$KEEPER_PK" ]; then
             echo "::warning::KEEPER_PK secret not set — skipping."

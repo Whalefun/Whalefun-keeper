@@ -45,6 +45,8 @@ const GAS_LIMIT = 900000n; // 实测一次有界买入 30~36 万 gas(两跳路�
 const TRIGGER_SERVICE = "0xcf4EE25035CF883895110f367F5BA8172416a7F9"; // FlapTriggerService(燃烧池金库自己预约回调用的)
 const MULTICALL3 = "0xcA11bde05977b3631167028862bE2a173976CA11";
 const STALE_GRACE = 1800n; // BurnPoolVault.STALE_GRACE:预约时间过了这么久还没回调,合约自己也当它作废、允许重新预约
+const REF_WINDOW = 600n; // BurnPoolVault.REF_WINDOW:金库参考价两次更新至少隔这么久,不满 10 分钟 poke 也不更新
+const PRICE_LAG_BPS = BigInt(process.env.BURN_POOL_PRICE_LAG_BPS || "100"); // 金库价和现价差到这个比例(默认 1%)才去刷新
 const POKE_GAS_LIMIT = 1500000n; // 实测空 poke 约 18 万 gas、帮烧一轮 + 重新预约约 41 万;再叠上拉盘买币也远低于此,用不完自动退
 
 if ((!PK && !DRY) || MINT_FACTORIES.length + CURVE_FACTORIES.length + BURN_POOL_FACTORIES.length === 0) {
@@ -115,6 +117,9 @@ const BURN_POOL_ABI = [
   "function scheduledFor() view returns (uint64)",
   "function roundCount() view returns (uint256)",
   "function pendingRequestId() view returns (uint256)",
+  "function refPrice() view returns (uint256)",
+  "function obsTime() view returns (uint256)",
+  "function spotPrice() view returns (uint256)",
   "function poke()",
 ];
 const TRIGGER_ABI = ["function getFee() view returns (uint256)"];
@@ -263,44 +268,52 @@ const fmtLeft = (s) => `${s / 3600n} 小时 ${(s % 3600n) / 60n} 分`;
 // (2026-10-15 鲸鱼人生有人投诉"到点没帮烧")。所以这里替它调 permissionless 的 poke(),热钱包只付 gas。满足任一条件才考虑:
 //   (a) 有最后燃烧人,且已到点
 //   (b) 定时器没在预约(或预约已过期),且金库余额够付预约费 —— poke 会顺带重新预约
-// 发之前先模拟:经 Multicall3 在同一个 eth_call 里先 poke() 再读 roundCount / scheduled / pendingRequestId,
-// 只有"会帮烧"或"会预约上"才发 —— 储备不足一轮或余额扣掉 LP 那半税后不够预约费时 poke 是空操作,不白烧 gas。
+//   (c) 金库价(参考价)满 10 分钟没更新,且和现价差 ≥ PRICE_LAG_BPS(默认 1%)。参考价是"上次更新到这次更新"整段的
+//       均价、只在有人碰金库时才更新,定时器一停就常常几个小时不动,页面上的金库价跟行情差得很远(2026-10-23 社区反馈)。
+//       合约规定两次更新至少隔 10 分钟,这里只在行情真的动了才刷新 —— 这也就是定时器正常时每 10 分钟一次的节奏。
+// 发之前先模拟:经 Multicall3 在同一个 eth_call 里先 poke() 再读 roundCount / scheduled / pendingRequestId / obsTime,
+// 只有"会帮烧""会预约上"或"金库价会刷新"才发 —— 储备不足一轮、余额扣掉 LP 那半税后不够预约费时 poke 是空操作,不白烧 gas。
 async function tryBurnPool(vault, now, fee) {
   const v = new ethers.Contract(vault, BURN_POOL_ABI, signerOrProvider);
-  let burner, dueAt, sched, schedFor, rounds, reqId, bal;
+  let burner, dueAt, sched, schedFor, rounds, reqId, ref, obsAt, spot, bal;
   try {
-    [burner, dueAt, sched, schedFor, rounds, reqId, bal] = await Promise.all([
-      v.lastBurner(), v.nextRoundAt(), v.scheduled(), v.scheduledFor(), v.roundCount(), v.pendingRequestId(), provider.getBalance(vault),
+    [burner, dueAt, sched, schedFor, rounds, reqId, ref, obsAt, spot, bal] = await Promise.all([
+      v.lastBurner(), v.nextRoundAt(), v.scheduled(), v.scheduledFor(), v.roundCount(), v.pendingRequestId(),
+      v.refPrice(), v.obsTime(), v.spotPrice(), provider.getBalance(vault),
     ]);
   } catch (e) { console.error(`燃烧池金库 ${vault} 读取失败:`, e.shortMessage || e.message); return false; }
   const hasBurner = burner !== ethers.ZeroAddress;
   const due = hasBurner && now >= dueAt;
   const armed = sched && now <= schedFor + STALE_GRACE;
   const canArm = !armed && fee !== null && bal >= fee;
+  const gapBps = ref > 0n && spot > 0n ? ((spot > ref ? spot - ref : ref - spot) * 10000n) / ref : 0n;
+  const lagging = obsAt > 0n && now >= obsAt + REF_WINDOW && gapBps >= PRICE_LAG_BPS;
   console.log(
     `燃烧池金库 ${vault}: 帮烧到点 ${hasBurner ? fmtTime(dueAt) + (due ? "(已到点)" : `(还差 ${fmtLeft(dueAt - now)})`) : "—(还没有最后燃烧人)"}` +
       ` · 定时器 ${armed ? "已预约 " + fmtTime(schedFor) : sched ? "预约已过期" : "未预约"}` +
-      ` · 余额 ${ethers.formatEther(bal)} BNB / 预约费 ${fee === null ? "读不到" : ethers.formatEther(fee)}`
+      ` · 余额 ${ethers.formatEther(bal)} BNB / 预约费 ${fee === null ? "读不到" : ethers.formatEther(fee)}` +
+      ` · 金库价${spot >= ref ? "低于" : "高于"}现价 ${(Number(gapBps) / 100).toFixed(2)}%(${fmtTime(obsAt)} 更新)`
   );
-  if (!due && !canArm) { console.log("  → 本轮不 poke"); return false; }
+  if (!due && !canArm && !lagging) { console.log("  → 本轮不 poke"); return false; }
 
   const mc = new ethers.Interface(MULTICALL3_ABI);
-  const reads = ["roundCount", "scheduled", "pendingRequestId"];
+  const reads = ["roundCount", "scheduled", "pendingRequestId", "obsTime"];
   const calls = ["poke", ...reads].map((f) => ({ target: vault, allowFailure: true, callData: v.interface.encodeFunctionData(f) }));
-  let roundsAfter, schedAfter, reqIdAfter;
+  let roundsAfter, schedAfter, reqIdAfter, obsAfter;
   try {
     const raw = await provider.call({ to: MULTICALL3, from: wallet?.address, data: mc.encodeFunctionData("aggregate3", [calls]) });
     const [res] = mc.decodeFunctionResult("aggregate3", raw);
     if (!res[0].success) { console.log(`  → 模拟 poke() 会回滚(${res[0].returnData}),本轮不发`); return false; }
-    [roundsAfter, schedAfter, reqIdAfter] = reads.map((f, i) => v.interface.decodeFunctionResult(f, res[i + 1].returnData)[0]);
+    [roundsAfter, schedAfter, reqIdAfter, obsAfter] = reads.map((f, i) => v.interface.decodeFunctionResult(f, res[i + 1].returnData)[0]);
   } catch (e) { console.error("  → 模拟失败,本轮不发:", e.shortMessage || e.message); return false; }
   const willBurn = roundsAfter > rounds;
   const willArm = schedAfter && reqIdAfter !== reqId;
-  if (!willBurn && !willArm) {
-    console.log("  → 模拟显示这次 poke 既不会帮烧、也预约不上定时器(储备不足一轮,或余额不够预约费),本轮不发");
+  const willRefresh = lagging && obsAfter > obsAt; // 只认(c):否则"到点但储备不足"时会借着刷新价格每 10 分钟空发一笔
+  if (!willBurn && !willArm && !willRefresh) {
+    console.log("  → 模拟显示这次 poke 不会帮烧、预约不上定时器、金库价也不会刷新,本轮不发");
     return false;
   }
-  const what = [willBurn && `帮烧第 ${roundsAfter} 轮`, willArm && "重新预约定时器"].filter(Boolean).join(" + ");
+  const what = [willBurn && `帮烧第 ${roundsAfter} 轮`, willArm && "重新预约定时器", willRefresh && "刷新金库价"].filter(Boolean).join(" + ");
   await send(`燃烧池金库 poke(${what})`, vault, (o) => v.poke({ ...o, gasLimit: POKE_GAS_LIMIT }));
   return true;
 }
