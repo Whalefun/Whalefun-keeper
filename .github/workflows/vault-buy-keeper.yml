@@ -59,6 +59,8 @@ jobs:
           MIN_PENDING_WEI: ${{ vars.VAULT_BUY_MIN_PENDING_WEI }}
           # 燃烧池金库价和现价差到多少(基点)才刷新,不设 = 100(1%)
           BURN_POOL_PRICE_LAG_BPS: ${{ vars.VAULT_BUY_BURN_POOL_PRICE_LAG_BPS }}
+          # 不管差多少,金库价最多隔多少秒刷新一次,不设 = 3600(1 小时)
+          BURN_POOL_REF_MAX_AGE_SEC: ${{ vars.VAULT_BUY_BURN_POOL_REF_MAX_AGE_SEC }}
         run: |
           if [ -z "$KEEPER_PK" ]; then
             echo "::warning::KEEPER_PK secret not set — skipping."
