@@ -42,21 +42,26 @@ const NET = (process.env.TRON_NETWORK || "nile").toLowerCase();
 const NETS = {
   nile: {
     host: "https://nile.trongrid.io",
-    launchFactory: "TMaRHuvjPz4m4fNw4rtwabxRS88eiE7qz5",
-    curveFactory: "TK4MouYJp1k3SvviVpgV3LEJTFuf17etqC",
+    launchFactories: ["TMaRHuvjPz4m4fNw4rtwabxRS88eiE7qz5"],
+    curveFactories: ["TK4MouYJp1k3SvviVpgV3LEJTFuf17etqC"],
   },
   tron: {
     host: "https://api.trongrid.io",
-    launchFactory: "TNrevrNW66ELYkVTcXdHixcAEpKfyMwKzA",
-    curveFactory: "TZ9kFGCg7xGq6iVyn4NEGjofviXFiuU6rP",
+    launchFactories: ["TNrevrNW66ELYkVTcXdHixcAEpKfyMwKzA"],
+    // TZ9k… is the curve factory the site launches on. TPJC585… is the dividend-settings version
+    // deployed on 2026-09-13 and taken off the site the same day; the contract itself stays
+    // permissionless, so a launch made on it directly would otherwise never be served.
+    curveFactories: ["TZ9kFGCg7xGq6iVyn4NEGjofviXFiuU6rP", "TPJC585iCCNvjgMDjiptU3qvFXmc5u8uTN"],
   },
 };
 const CFG = NETS[NET];
 if (!CFG) throw new Error(`TRON_NETWORK 只能是 nile 或 tron,收到 "${NET}"`);
 
+/** Comma-separated override; an unset variable keeps the built-in list. */
+const listEnv = (v, fallback) => (v ? v.split(",").map((s) => s.trim()).filter(Boolean) : fallback);
 const HOST = process.env.TRON_HOST || CFG.host;
-const LAUNCH_FACTORY = process.env.TRON_LAUNCH_FACTORY || CFG.launchFactory;
-const CURVE_FACTORY = process.env.TRON_CURVE_FACTORY || CFG.curveFactory;
+const LAUNCH_FACTORIES = listEnv(process.env.TRON_LAUNCH_FACTORY, CFG.launchFactories);
+const CURVE_FACTORIES = listEnv(process.env.TRON_CURVE_FACTORY, CFG.curveFactories);
 const API_KEY = process.env.TRONGRID_API_KEY || "";
 const SCAN_BLOCKS = Number(process.env.SCAN_BLOCKS || 1500); // 3s blocks -> ~75 min of overlap
 const MAX_RANGE = 5000; // TronGrid's hard cap, measured
@@ -67,6 +72,9 @@ const ADD_BATCH = Number(process.env.ADD_BATCH || 40);
 const TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
 const started = Date.now();
 const timeUp = () => (Date.now() - started) / 1000 > BUDGET_S;
+// Transactions that failed or reverted this run. Any at all makes the process exit non-zero, so the
+// Actions run shows red instead of a green run that quietly paid nobody.
+let failures = 0;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const PK = (process.env.TRON_KEEPER_PK || "").replace(/^0x/, "");
@@ -74,6 +82,7 @@ if (!PK && !DRY_RUN) throw new Error("TRON_KEEPER_PK 未设置(只想看不发�
 
 const tw = new TronWeb({ fullHost: HOST, privateKey: PK || "01".repeat(32) });
 const ME = tw.defaultAddress.base58;
+const ZERO_B58 = tw.address.fromHex("41" + "0".repeat(40));
 
 const headers = API_KEY ? { "TRON-PRO-API-KEY": API_KEY } : {};
 
@@ -161,6 +170,7 @@ async function sendTx(contract, selector, parameter, feeLimit, label) {
     const info = await rpc("/wallet/gettransactioninfobyid", { value: id });
     if (info && info.receipt) {
       const ok = info.receipt.result === "SUCCESS";
+      if (!ok) failures++;
       console.log(
         `    ${label}: ${info.receipt.result}  energy ${(info.receipt.energy_usage_total || 0).toLocaleString()}  tx ${id.slice(0, 12)}…`
       );
@@ -171,8 +181,15 @@ async function sendTx(contract, selector, parameter, feeLimit, label) {
   return null;
 }
 
-/** Every launch this factory has registered, newest first. */
-async function launches(factory) {
+/**
+ * Every launch this factory has registered, newest first.
+ *
+ * The two factories answer `launches(i)` differently. LaunchFactoryV2U returns a struct
+ * (token, vault, taxVault, pair, creator, createdAt); BondingCurveTaxFactory returns only the token
+ * address, and the token itself knows its tax vault and pair. Reading a curve factory's answer as
+ * the struct took words that are not there, so no curve launch's vault was ever found.
+ */
+async function launches(factory, kind) {
   const n = await readU(factory, "launchCount()");
   if (n === null) return [];
   const out = [];
@@ -180,12 +197,22 @@ async function launches(factory) {
     const v = await read(factory, "launches(uint256)", i.toString(16).padStart(64, "0"));
     if (!v) continue;
     const at = (k) => "41" + v.slice(k * 64 + 24, (k + 1) * 64);
-    out.push({
-      i,
-      token: tw.address.fromHex(at(0)),
-      taxVault: tw.address.fromHex(at(2)),
-      pair: tw.address.fromHex(at(3)),
-    });
+    if (kind === "mint") {
+      out.push({
+        i,
+        token: tw.address.fromHex(at(0)),
+        taxVault: tw.address.fromHex(at(2)),
+        pair: tw.address.fromHex(at(3)),
+      });
+    } else {
+      const token = tw.address.fromHex(at(0));
+      out.push({
+        i,
+        token,
+        taxVault: (await readAddr(token, "taxVault()")) || ZERO_B58,
+        pair: (await readAddr(token, "pair()")) || ZERO_B58,
+      });
+    }
   }
   return out;
 }
@@ -288,23 +315,32 @@ async function processVault(v) {
   console.log(`  余额 ${(bal / 1e6).toFixed(2)} TRX   API Key ${API_KEY ? "已配置" : "未配置(限 3 次/秒)"}`);
 
   let handled = 0;
-  for (const factory of [LAUNCH_FACTORY, CURVE_FACTORY]) {
-    const list = await launches(factory);
-    console.log(`\n工厂 ${factory}:${list.length} 个发射`);
+  const factories = [
+    ...LAUNCH_FACTORIES.map((f) => [f, "mint"]),
+    ...CURVE_FACTORIES.map((f) => [f, "curve"]),
+  ];
+  for (const [factory, kind] of factories) {
+    const list = await launches(factory, kind);
+    console.log(`\n${kind === "mint" ? "mint" : "曲线"}工厂 ${factory}:${list.length} 个发射`);
     for (const v of list) {
       if (timeUp()) {
         console.log("  时间预算用尽,本轮提前收尾(下一轮继续)");
         break;
       }
-      if (v.taxVault === tw.address.fromHex("41" + ZERO_HEX)) continue;
+      if (v.taxVault === ZERO_B58) continue;
       try {
         if (await processVault(v)) handled++;
       } catch (e) {
+        failures++;
         console.error(`  金库 ${v.taxVault} 出错:`, e.message || e);
       }
     }
   }
   console.log(`\n处理了 ${handled} 个 LP 分红金库,用时 ${((Date.now() - started) / 1000).toFixed(0)}s`);
+  if (failures) {
+    console.error(`有 ${failures} 处失败(见上面),本次运行标为失败`);
+    process.exit(1);
+  }
 })().catch((e) => {
   console.error("失败:", e.message || e);
   process.exit(1);
