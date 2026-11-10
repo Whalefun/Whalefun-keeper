@@ -1,20 +1,25 @@
 name: tron-lp-keeper
 
-# Drives the LP-holder dividend vaults on TRON: registers LP holders the vault has not seen, and
-# runs a payout round once a vault's pot is over its threshold. Everything it calls is
+# Drives the LP-holder dividend vaults on TRON mainnet: registers LP holders the vault has not seen,
+# and runs a payout round once a vault's pot is over its threshold. Everything it calls is
 # PERMISSIONLESS — the hot wallet only pays energy and holds no authority over anyone's funds.
 #
-# One-time setup:
-#   1) Generate a FRESH TRON wallet (never the deployer/guardian key). Fund it with TRX for energy.
-#      How much: a round costs roughly 40,000 + 6,600 x holders of energy, and the wallet must be
-#      able to back the transaction's feeLimit, not just the part actually spent. A few hundred TRX
-#      covers a vault with a hundred holders comfortably.
-#   2) Repo Settings -> Secrets and variables -> Actions:
-#        Secret   TRON_KEEPER_PK     that wallet's private key
-#        Secret   TRONGRID_API_KEY   free key from trongrid.io (without it TronGrid allows 3 req/s
-#                                    shared across everyone on this IP, and a run will trip 429)
-#        Variable TRON_NETWORK       "tron" for mainnet, "nile" for testnet (default nile)
-#   3) Run it once from the Actions tab with DRY_RUN to see what it would do.
+# 触发方式:只有 workflow_dispatch —— 由 cron-job.org 每 15 分钟 POST 一次 dispatch 接口,
+# 不用 GitHub 自带定时器(名义 15 分钟,实际常常几小时才跑一次)。做法和另外两个 keeper 一样:
+#   POST https://api.github.com/repos/Whalefun/Whalefun-keeper/actions/workflows/tron-keeper.yml/dispatches
+#   Header  Authorization: Bearer <细粒度令牌,本仓库 Actions 读写>   Accept: application/vnd.github+json
+#   Body    {"ref":"main"}
+#   成功返回 204。现有那个令牌(2027-10-10 16:00 UTC 到期)权限就够,可以直接复用。
+#
+# 一次性设置:
+#   1) 新建一个 TRON 热钱包(不能用部署/guardian 钱包),充一些 TRX 付能量。
+#      一轮派发约 40,000 + 6,600 × 持有人数 能量;钱包余额还要撑得起 feeLimit(按需要量 ×1.2 算)。
+#      几百 TRX 够一个上百人的金库跑很多轮。只有池子攒够门槛才派发,平时只读不花钱。
+#   2) 仓库 Settings -> Secrets and variables -> Actions:
+#        Secret   TRON_KEEPER_PK     那个钱包的私钥(没设时本 workflow 只提示、不报错)
+#        Secret   TRONGRID_API_KEY   trongrid.io 的免费 key(可选;不设时整个 IP 共享 3 次/秒,容易 429)
+#        Variable TRON_NETWORK       不设 = tron(主网);测 Nile 时设成 nile
+#   3) 先在 Actions 页手动 Run workflow,dry_run 填 1,看它会做什么;没问题再建 cron-job.org 任务。
 #
 # Why 15 minutes is enough on this chain: registration works by reading the LP token's Transfer
 # events, TronGrid allows 5,000 blocks per getLogs call, and TRON produces a block every 3 seconds.
@@ -22,8 +27,6 @@ name: tron-lp-keeper
 # far more overlap than the schedule needs, which is why this keeper needs no cursor or resume file.
 
 on:
-  schedule:
-    - cron: "*/15 * * * *" # best-effort; GitHub may delay a run
   workflow_dispatch:
     inputs:
       dry_run:
@@ -44,13 +47,19 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
+      # 仓库不提交 package-lock.json,所以不能用 npm ci,也不能开 setup-node 的 npm 缓存
       - run: npm install --no-audit --no-fund
       - name: run keeper
         env:
           TRON_KEEPER_PK: ${{ secrets.TRON_KEEPER_PK }}
           TRONGRID_API_KEY: ${{ secrets.TRONGRID_API_KEY }}
-          TRON_NETWORK: ${{ vars.TRON_NETWORK || 'nile' }}
+          TRON_NETWORK: ${{ vars.TRON_NETWORK || 'tron' }}
           SCAN_BLOCKS: ${{ vars.TRON_SCAN_BLOCKS || '1500' }}
           BUDGET_S: "600"
           DRY_RUN: ${{ github.event.inputs.dry_run || '0' }}
-        run: node tron-lp-keeper.mjs
+        run: |
+          if [ -z "$TRON_KEEPER_PK" ] && [ "$DRY_RUN" != "1" ]; then
+            echo "::warning::TRON_KEEPER_PK secret not set — skipping. Add it in repo Settings → Secrets to enable the TRON keeper."
+            exit 0
+          fi
+          node tron-lp-keeper.mjs
